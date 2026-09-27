@@ -609,6 +609,12 @@ def snapHUCsToCorridors(hucs: Watershed,
     corners) are never moved.  A linestring whose snapped version would
     self-intersect is left unchanged, with a warning.
 
+    Only interior HUC boundaries are snapped, never the domain's exterior
+    boundary.  An exterior boundary made to coincide with a corridor edge
+    leaves nothing between them to triangulate, so the corridor vertices
+    there belong to no triangle; Triangle then drops them from its output
+    and renumbers every later vertex, which scrambles the river elements.
+
     Must be called after createRiversMesh() and before triangulation.
     Modifies hucs.linestrings in place.
 
@@ -639,9 +645,11 @@ def snapHUCsToCorridors(hucs: Watershed,
     ring_trees = [shapely.STRtree([shapely.geometry.Point(p) for p in ring]) for ring in rings]
     all_rings = shapely.ops.unary_union(ring_linestrings)
 
+    exterior_handles = set(h for spine in hucs.boundaries.values() for h in spine.values())
+
     report = []
     for handle, ls in list(hucs.linestrings.items()):
-        if all_rings.distance(ls) > tol:
+        if handle in exterior_handles or all_rings.distance(ls) > tol:
             continue
 
         # snap each interior vertex near a corridor to the closest corridor vertex

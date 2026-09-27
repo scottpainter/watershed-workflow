@@ -67,3 +67,15 @@ def test_snapped_boundary_stays_outside_corridor_interior():
     interior = _corridor().buffer(-1.e-6)
     for ls in hucs.linestrings.values():
         assert ls.intersection(interior).length < 1.e-9
+
+
+def test_exterior_boundary_never_snapped():
+    # one HUC whose exterior edge x=110 runs 2 m from a corridor at x in [104, 108]
+    edge = [(110., y) for y in (0., 25., 50., 75., 100.)]
+    poly = shapely.geometry.Polygon([(0., 0.)] + edge + [(0., 100.)])
+    hucs = watershed_workflow.hydro.watershed.Watershed(geopandas.GeoDataFrame(geometry=[poly]))
+    ys = [10., 30., 50., 70., 90.]
+    corridor = shapely.geometry.Polygon([(104., y) for y in ys] + [(108., y) for y in reversed(ys)])
+    before = {h: list(ls.coords) for h, ls in hucs.linestrings.items()}
+    assert snapHUCsToCorridors(hucs, [corridor, ], tol=5.) == []
+    assert {h: list(ls.coords) for h, ls in hucs.linestrings.items()} == before

@@ -636,7 +636,7 @@ def tessalateRiverAligned(hucs : Watershed,
                           plot : bool = False,
                           debug : bool = False,
                           triangulate : bool = True,
-                          snap_hucs_to_corridors_tol : float = 10.0,
+                          snap_hucs_to_corridors_tol : float = 15.0,
                           **kwargs) -> \
                        watershed_workflow.mesh.mesh.Mesh2D | \
                        Tuple[watershed_workflow.mesh.mesh.Mesh2D, np.ndarray, np.ndarray]:
@@ -668,11 +668,11 @@ def tessalateRiverAligned(hucs : Watershed,
        For debugging -- plots troublesome reaches as quad elements are
        generated to find tricky areas.
     snap_hucs_to_corridors_tol : float, optional
-       HUC boundary vertices within this distance (CRS units) of a river
-       corridor are snapped onto the corridor's own vertices before
-       triangulation, so that boundaries running alongside a corridor do
-       not leave thin gaps that fill with tiny cells (see
-       mesh.river_mesh.snapHUCsToCorridors()).  Default 10.  Set to 0 to
+       Interior HUC boundary vertices within this distance (CRS units) of
+       a river corridor are snapped onto the corridor's own vertices
+       before triangulation, so that boundaries running alongside a
+       corridor do not leave thin gaps that fill with tiny cells (see
+       mesh.river_mesh.snapHUCsToCorridors()).  Default 15.  Set to 0 to
        disable.
     kwargs :
        All other arguments are passed to the triangulation function for refinement.
@@ -732,7 +732,22 @@ def tessalateRiverAligned(hucs : Watershed,
 
     tri_coords = tri_res[0]
     tri_elems : List[List[int]] = [tri.tolist() for tri in tri_res[1]]
-    
+
+    # The river elements index river_coords, which are only valid in the
+    # triangulation if the river vertices come out first and in the same
+    # order.  Triangle drops (and renumbers around) any input vertex that is
+    # in no triangle, e.g. a corridor vertex with no land between it and the
+    # domain boundary, which would silently scramble the river elements.
+    n_river = len(river_coords)
+    if len(tri_coords) < n_river or \
+       not np.allclose(np.asarray(tri_coords)[:n_river, 0:2], np.asarray(river_coords)[:, 0:2], atol=1.e-3):
+        tri_keys = set(tuple(np.round(p[0:2], 3)) for p in tri_coords)
+        missing = [tuple(p[0:2]) for p in river_coords if tuple(np.round(p[0:2], 3)) not in tri_keys]
+        raise RuntimeError('tessalateRiverAligned: the triangulation did not preserve the river-corridor '
+                           f'vertices ({len(missing)} missing, e.g. {missing[:5]}); a corridor vertex likely '
+                           'has no triangulated land next to it, e.g. where a HUC boundary coincides with '
+                           'the corridor edge along the domain boundary.')
+
     # merge elements into a single output
     elems = tri_elems + river_elems
     # note, all river verts are in the tri_verts, listed first, and in the same order!
