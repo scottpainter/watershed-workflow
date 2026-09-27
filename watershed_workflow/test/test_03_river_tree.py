@@ -6,6 +6,7 @@ from matplotlib import pyplot as plt
 
 from watershed_workflow.test.shapes import *
 import watershed_workflow.hydro.river
+import watershed_workflow.sources.standard_names as names
 
 import geopandas
 
@@ -218,8 +219,52 @@ def test_split_arclen_errors():
         node.split(-0.5)
     with pytest.raises(Exception):
         node.split(3.5)
-    
-    
+
+
+@pytest.fixture
+def three_in_a_row():
+    """root <-- mid <-- top, with hydroseq decreasing downstream."""
+    mls = [shapely.geometry.LineString([(1, 0), (0, 0)]),
+           shapely.geometry.LineString([(3, 0), (2, 0), (1, 0)]),
+           shapely.geometry.LineString([(4, 0), (3, 0)])]
+    df = geopandas.GeoDataFrame({'index' : [10, 20, 30],
+                                 'hydroseq' : [1, 2, 3],
+                                 'dnhydroseq' : [0, 1, 2],
+                                 'uphydroseq' : [2, 3, 0],
+                                 'geometry' : mls}).set_index('index')
+    return watershed_workflow.hydro.river.createRivers(df, 'hydroseq')[0]
+
+
+def test_split_hydroseq(three_in_a_row):
+    river = three_in_a_row
+    root = river
+    mid = root.children[0]
+    top = mid.children[0]
+
+    us, ds = mid.split(1)
+    assert ds is mid
+
+    # the upstream piece keeps the original hydroseq, so top still drains into it
+    assert us[names.HYDROSEQ] == 2
+    assert top.parent is us
+    assert top[names.DOWNSTREAM_HYDROSEQ] == us[names.HYDROSEQ]
+
+    # the downstream piece sits between the upstream piece and root
+    assert root[names.HYDROSEQ] < ds[names.HYDROSEQ] < us[names.HYDROSEQ]
+    assert us[names.DOWNSTREAM_HYDROSEQ] == ds[names.HYDROSEQ]
+    assert ds[names.UPSTREAM_HYDROSEQ] == us[names.HYDROSEQ]
+    assert root[names.UPSTREAM_HYDROSEQ] == ds[names.HYDROSEQ]
+    assert river.isHydroseqConsistent()
+
+
+def test_split_hydroseq_root(three_in_a_row):
+    river = three_in_a_row
+    us, ds = river.splitAtArclen(0.5)
+    assert ds is river
+    assert ds[names.HYDROSEQ] < us[names.HYDROSEQ] == 1
+    assert river.isHydroseqConsistent()
+
+
 def test_prune():
     s2 = shapely.geometry.LineString([(2, 0), (1, 0)])
     s1 = shapely.geometry.LineString([(1, 0), (0, 0)])

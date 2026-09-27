@@ -25,6 +25,9 @@ __all__ = [
     'findOutletsByCrossings',
     'findOutletsByElevation',
     'findOutletsByHydroseq',
+    'findHUCOutlets',
+    'updateToHUCs',
+    'MultipleOutletsError',
     'snapWaterbodies',
     'cutAndSnapCrossings',
     'snapHUCsJunctions',
@@ -289,6 +292,190 @@ def findOutletsByHydroseq(hucs: Watershed, river: River, tol: float = 0.0) -> No
             break
 
     hucs.df[names.OUTLET] = polygon_outlets
+
+
+class MultipleOutletsError(RuntimeError):
+    """Raised when the river network leaves a HUC at more than one location.
+
+    Attributes
+    ----------
+    outlets : Dict[Any, List[HUCOutlet]]
+        For each offending HUC (keyed by its ID), all of its outlet locations.
+    """
+    def __init__(self, msg: str, outlets: Dict[Any, List['HUCOutlet']]):
+        super().__init__(msg)
+        self.outlets = outlets
+
+
+class HUCOutlet(collections.namedtuple('HUCOutlet', ['point', 'reaches', 'downstream'])):
+    """One location where the river network leaves a HUC.
+
+    point : shapely.geometry.Point
+        The location, i.e. the downstream end of the exiting reach(es).
+    reaches : List[River]
+        The reaches that leave the HUC at this location (more than one
+        when branches meet exactly on the divide).
+    downstream : Optional[int]
+        Index of the HUC the reaches flow into, or None if they leave the
+        domain.
+    """
+    __slots__ = ()
+
+
+def findHUCOutlets(hucs: Watershed, rivers: List[River], tol: float = 1.0) -> List[List[HUCOutlet]]:
+    """Find every location where the river network leaves each HUC.
+
+    Intended for use after cutAndSnapCrossings() (e.g. after simplify()),
+    when every place a reach crosses a HUC boundary is a reach endpoint, so
+    that each reach lies in a single HUC.  Each reach is assigned to the
+    HUC holding most of its length; a reach whose downstream neighbor lies
+    in a different HUC (or which has no downstream neighbor) is an exit.
+    Exits whose downstream endpoints are within tol of each other are one
+    outlet location, e.g. two branches that meet exactly on the divide.
+
+    Parameters
+    ----------
+    hucs : Watershed
+        Split HUCs object.
+    rivers : List[River]
+        River networks.
+    tol : float, optional
+        Distance within which exits are considered the same location.
+
+    Returns
+    -------
+    List[List[HUCOutlet]]
+        For each HUC, in the order of hucs.polygons(), its outlet locations.
+    """
+    polygons = list(hucs.polygons())
+    tree = shapely.STRtree(polygons)
+
+    def _containingPolygon(reach: River) -> int | None:
+        candidates = tree.query(reach.linestring)
+        if len(candidates) == 0:
+            return None
+        lengths = [reach.linestring.intersection(polygons[i]).length for i in candidates]
+        k = int(np.argmax(lengths))
+        return int(candidates[k]) if lengths[k] > 0 else None
+
+    home = { id(reach) : _containingPolygon(reach) for river in rivers for reach in river }
+
+    outlets : List[List[HUCOutlet]] = [list() for poly in polygons]
+    for river in rivers:
+        for reach in river:
+            i = home[id(reach)]
+            if i is None:
+                continue
+            j = home[id(reach.parent)] if reach.parent is not None else None
+            if j == i:
+                continue
+
+            point = shapely.geometry.Point(reach.linestring.coords[-1])
+            for outlet in outlets[i]:
+                if outlet.point.distance(point) < tol:
+                    if outlet.downstream != j:
+                        raise RuntimeError(f'findHUCOutlets: reaches leaving polygon {i} at {point} '
+                                           f'flow into different polygons {outlet.downstream} and {j}')
+                    outlet.reaches.append(reach)
+                    break
+            else:
+                outlets[i].append(HUCOutlet(point, [reach, ], j))
+    return outlets
+
+
+def updateToHUCs(hucs: Watershed,
+                 rivers: List[River],
+                 id_col: str = names.ID,
+                 tohuc_col: str = 'tohuc',
+                 original_col: str | None = 'tohuc_wbd',
+                 tol: float = 1.0) -> None:
+    """Make each HUC's downstream-HUC attribute and outlet agree with the geometry.
+
+    Operations that move HUC boundaries or reaches (notably
+    snapHUCsJunctions() within simplify(), which snaps a HUC triple
+    junction onto a nearby confluence) can change which HUC a HUC drains
+    into, leaving the source data's downstream-HUC attribute (e.g. WBD's
+    "tohuc") inconsistent with the geometry.  This recomputes it, and the
+    outlet point, from the river network.
+
+    Every HUC must have exactly one outlet location (see findHUCOutlets()).
+    A HUC that the network leaves at more than one location is a topology
+    defect in the inputs and is reported, not resolved: MultipleOutletsError
+    is raised listing every such HUC with its exit reaches and locations.
+
+    Modifies hucs.df in place:
+
+    - tohuc_col is set to the id_col value of the HUC across the outlet.
+      For a HUC whose outlet leaves the domain, a value that does not name
+      a HUC in the domain (e.g. the downstream HUC outside it) is kept;
+      otherwise it is set to None.  A HUC that no reach leaves keeps its
+      value, with a warning.
+    - names.OUTLET is set to the outlet point.
+    - If original_col is given and not already present, the incoming
+      tohuc_col values are first saved there.
+
+    Parameters
+    ----------
+    hucs : Watershed
+        Split HUCs object, whose df has id_col (and optionally tohuc_col).
+    rivers : List[River]
+        River networks, after cutAndSnapCrossings().
+    id_col : str, optional
+        Column of hucs.df identifying each HUC.
+    tohuc_col : str, optional
+        Column of hucs.df holding the downstream HUC's id.
+    original_col : str or None, optional
+        Column in which to preserve the original tohuc_col values.
+    tol : float, optional
+        See findHUCOutlets().
+    """
+    ids = list(hucs.df[id_col])
+    outlets = findHUCOutlets(hucs, rivers, tol)
+
+    multiple = { ids[i] : outlet_list for i, outlet_list in enumerate(outlets) if len(outlet_list) > 1 }
+    if len(multiple) > 0:
+        lines = [f'{len(multiple)} HUC(s) have more than one outlet location; each HUC must have exactly one:']
+        for huc_id, outlet_list in multiple.items():
+            lines.append(f'  HUC {huc_id}:')
+            for outlet in outlet_list:
+                dest = 'domain exterior' if outlet.downstream is None else f'HUC {ids[outlet.downstream]}'
+                reach_ids = [r[names.ID] if names.ID in r else r.index for r in outlet.reaches]
+                lines.append(f'    at ({outlet.point.x:.1f}, {outlet.point.y:.1f}) into {dest} via reach(es) {reach_ids}')
+        raise MultipleOutletsError('\n'.join(lines), multiple)
+
+    if tohuc_col in hucs.df.columns:
+        old = list(hucs.df[tohuc_col])
+    else:
+        old = [None for i in ids]
+    if original_col is not None and original_col not in hucs.df.columns:
+        hucs.df[original_col] = old
+
+    new_tohuc = []
+    new_outlet = []
+    exterior_outlets = []
+    for i, outlet_list in enumerate(outlets):
+        if len(outlet_list) == 0:
+            logging.warning(f'updateToHUCs: no reach leaves HUC {ids[i]}; keeping {tohuc_col} = {old[i]}')
+            new_tohuc.append(old[i])
+            new_outlet.append(hucs.df[names.OUTLET].iloc[i] if names.OUTLET in hucs.df.columns else None)
+            continue
+
+        outlet = outlet_list[0]
+        if outlet.downstream is None:
+            value = old[i] if old[i] not in ids else None
+            exterior_outlets.append(outlet.point)
+        else:
+            value = ids[outlet.downstream]
+        if value != old[i]:
+            logging.info(f'updateToHUCs: HUC {ids[i]} {tohuc_col} changed from {old[i]} to {value} '
+                         f'(outlet at ({outlet.point.x:.1f}, {outlet.point.y:.1f}))')
+        new_tohuc.append(value)
+        new_outlet.append(outlet.point)
+
+    hucs.df[tohuc_col] = new_tohuc
+    hucs.df[names.OUTLET] = new_outlet
+    if len(exterior_outlets) == 1:
+        hucs.exterior_outlet = exterior_outlets[0]
 
 
 def snapWaterbodies(waterbodies: List[shapely.geometry.base.BaseGeometry], hucs: Watershed,

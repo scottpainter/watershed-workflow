@@ -338,12 +338,30 @@ class River(watershed_workflow.utils.tinytree.Tree):
                     names.DRAINAGE_AREA] = self[names.DRAINAGE_AREA] - self[names.CATCHMENT_AREA]
 
         if names.HYDROSEQ in upstream_props:
-            upstream_props[names.HYDROSEQ] = (self[names.HYDROSEQ]
-                                              + self.parent[names.HYDROSEQ]) / 2.0
+            # Hydroseq decreases downstream.  The new upstream node keeps the
+            # original hydroseq (so this reach's children, whose downstream
+            # hydroseq names it, stay correct), and the downstream node (self)
+            # takes a value between the original and its downstream neighbor.
+            # the new values are fractional
+            for col in (names.HYDROSEQ, names.UPSTREAM_HYDROSEQ, names.DOWNSTREAM_HYDROSEQ):
+                if col in self.df and pandas.api.types.is_integer_dtype(self.df[col].dtype):
+                    self.df[col] = self.df[col].astype(float)
+
+            hydroseq = self[names.HYDROSEQ]
+            if self.parent is not None:
+                ds_hydroseq = (hydroseq + self.parent[names.HYDROSEQ]) / 2.0
+            else:
+                ds_hydroseq = hydroseq - 0.5
+
+            if self.parent is not None and names.UPSTREAM_HYDROSEQ in self.parent.properties \
+               and self.parent[names.UPSTREAM_HYDROSEQ] == hydroseq:
+                self.parent[names.UPSTREAM_HYDROSEQ] = ds_hydroseq
+
+            self[names.HYDROSEQ] = ds_hydroseq
             if names.UPSTREAM_HYDROSEQ in upstream_props:
-                self[names.UPSTREAM_HYDROSEQ] = upstream_props[names.HYDROSEQ]
+                self[names.UPSTREAM_HYDROSEQ] = hydroseq
             if names.DOWNSTREAM_HYDROSEQ in upstream_props:
-                upstream_props[names.DOWNSTREAM_HYDROSEQ] = self[names.HYDROSEQ]
+                upstream_props[names.DOWNSTREAM_HYDROSEQ] = ds_hydroseq
 
         if names.ID in self.properties:
             if self.df[names.ID].dtype != 'string':

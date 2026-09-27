@@ -226,7 +226,8 @@ def simplify(hucs : Watershed,
              junction_min_angle : float = 20,
              snap_triple_junctions_tol : Optional[float] = None,
              plot_diagnostics : bool = False,
-             keep_points : bool = False) -> None:
+             keep_points : bool = False,
+             update_tohuc : bool = True) -> None:
     """Simplifies, in place, the HUC and river shapes to create constrained, discrete segments.
 
     Parameters
@@ -282,6 +283,12 @@ def simplify(hucs : Watershed,
         If true, force intersections of the river network and the HUC
         boundary to occur at a coincident node by adding nodes as
         needed.
+    update_tohuc : bool, optional = True
+        If true and hucs.df has a 'tohuc' column, recompute each HUC's
+        downstream HUC and outlet from the simplified geometry (see
+        hydro.hydrography.updateToHUCs()), preserving the original values
+        in 'tohuc_wbd'.  Raises hydro.hydrography.MultipleOutletsError if
+        the river network leaves any HUC at more than one location.
 
     """
     logging.info("")
@@ -409,7 +416,14 @@ def simplify(hucs : Watershed,
     watershed_workflow.utils.geometry.logMinMaxMedianSegment(hucs.linestrings, "HUC  ")
 
     logging.info(rivers[0].df.crs)
-    
+
+    # snapping may have changed which HUC each HUC drains into
+    if update_tohuc and 'tohuc' in hucs.df.columns:
+        logging.info("")
+        logging.info("Updating downstream HUCs (tohuc) and outlets from the simplified geometry")
+        logging.info("-" * 30)
+        watershed_workflow.hydro.hydrography.updateToHUCs(hucs, rivers)
+
 
 def _triangulate(hucs : Watershed,
                  rivers : Optional[List[River]] = None,
