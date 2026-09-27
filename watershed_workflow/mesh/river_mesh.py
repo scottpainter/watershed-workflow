@@ -23,6 +23,7 @@ import watershed_workflow.sources.standard_names as names
 
 __all__ = [
     'createRiversMesh',
+    'snapHUCsToCorridors',
 ]
 
 
@@ -582,6 +583,111 @@ def adjustHUCsToRiverMesh(hucs: Watershed, river: River, coords: np.ndarray) -> 
                     point_i += 1
 
                 touch_i += 1
+
+
+def snapHUCsToCorridors(hucs: Watershed,
+                        corridors: List[shapely.geometry.Polygon],
+                        tol: float,
+                        max_gap_vertices: int = 10) -> List[Tuple[int, int, int]]:
+    """Make HUC boundaries that run alongside a river corridor follow its edge.
+
+    adjustHUCsToRiverMesh() moves the ends of HUC linestrings that touch a
+    river onto corridor coordinates, but a HUC boundary that runs close to
+    and roughly parallel with a corridor keeps its own, independently
+    resampled vertices.  The thin gap between the two then fills with tiny
+    triangles during triangulation, as the refinement tries to satisfy its
+    minimum angle, and those small cells limit the simulation time step.
+
+    Each interior vertex of a HUC linestring lying within tol of a corridor
+    outline is moved onto the nearest vertex of that outline.  Between two
+    consecutive snapped vertices on the same outline, the outline vertices
+    in between (the shorter way round, if there are at most
+    max_gap_vertices) are inserted, so that the boundary follows the
+    corridor edge exactly.  Only existing corridor vertices are used, so no
+    vertex is placed part-way along a quad edge.  Linestring endpoints (HUC
+    junctions, including those adjustHUCsToRiverMesh() placed on corridor
+    corners) are never moved.  A linestring whose snapped version would
+    self-intersect is left unchanged, with a warning.
+
+    Must be called after createRiversMesh() and before triangulation.
+    Modifies hucs.linestrings in place.
+
+    Parameters
+    ----------
+    hucs : Watershed
+        Split HUCs object, as modified by createRiversMesh().
+    corridors : List[shapely.geometry.Polygon]
+        River corridor polygons returned by createRiversMesh().
+    tol : float
+        Distance within which a HUC boundary vertex is snapped to the
+        corridor, in the units of the CRS.
+    max_gap_vertices : int, optional
+        Largest number of corridor vertices inserted between two
+        consecutive snapped vertices.
+
+    Returns
+    -------
+    List[Tuple[int, int, int]]
+        For each modified linestring: (handle, vertices snapped, corridor
+        vertices inserted).
+    """
+    rings = []
+    for corridor in corridors:
+        for ring in [corridor.exterior, ] + list(corridor.interiors):
+            rings.append(np.array(ring.coords)[:-1, 0:2])
+    ring_linestrings = [shapely.geometry.LineString(np.vstack([ring, ring[0:1]])) for ring in rings]
+    ring_trees = [shapely.STRtree([shapely.geometry.Point(p) for p in ring]) for ring in rings]
+    all_rings = shapely.ops.unary_union(ring_linestrings)
+
+    report = []
+    for handle, ls in list(hucs.linestrings.items()):
+        if all_rings.distance(ls) > tol:
+            continue
+
+        # snap each interior vertex near a corridor to the closest corridor vertex
+        coords = [tuple(c[0:2]) for c in ls.coords]
+        snapped : List[Tuple[Tuple[float, float], Optional[int], Optional[int]]] = []
+        n_snapped = 0
+        for i, c in enumerate(coords):
+            p = shapely.geometry.Point(c)
+            if 0 < i < len(coords) - 1 and all_rings.distance(p) < tol:
+                k = int(np.argmin([rls.distance(p) for rls in ring_linestrings]))
+                j = int(ring_trees[k].nearest(p))
+                snapped.append((tuple(rings[k][j]), k, j))
+                n_snapped += 1
+            else:
+                snapped.append((c, None, None))
+        if n_snapped == 0:
+            continue
+
+        # follow the corridor outline between consecutive snapped vertices
+        new_coords = [snapped[0][0], ]
+        n_inserted = 0
+        for (pa, ka, ja), (pb, kb, jb) in zip(snapped[:-1], snapped[1:]):
+            if ka is not None and ka == kb and ja != jb:
+                n = len(rings[ka])
+                forward = (jb - ja) % n
+                backward = (ja - jb) % n
+                step, count = (1, forward) if forward <= backward else (-1, backward)
+                if count - 1 <= max_gap_vertices:
+                    for t in range(1, count):
+                        new_coords.append(tuple(rings[ka][(ja + step*t) % n]))
+                        n_inserted += 1
+            new_coords.append(pb)
+
+        new_coords = [new_coords[0], ] + [c for c_prev, c in zip(new_coords[:-1], new_coords[1:])
+                                          if not watershed_workflow.utils.geometry.isClose(c, c_prev)]
+        new_ls = shapely.geometry.LineString(new_coords)
+        if len(new_coords) < 2 or not new_ls.is_simple:
+            logging.warning(f'snapHUCsToCorridors: snapping HUC linestring {handle} would make it '
+                            'self-intersect; leaving it unchanged')
+            continue
+        hucs.linestrings[handle] = new_ls
+        report.append((handle, n_snapped, n_inserted))
+
+    logging.info(f'snapHUCsToCorridors: snapped {sum(r[1] for r in report)} vertices on '
+                 f'{len(report)} HUC linestrings to river corridors (tol = {tol})')
+    return report
 
 
 def computeLine(p1: np.ndarray, p2: np.ndarray) -> Tuple[float, float, float]:

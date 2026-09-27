@@ -636,6 +636,7 @@ def tessalateRiverAligned(hucs : Watershed,
                           plot : bool = False,
                           debug : bool = False,
                           triangulate : bool = True,
+                          snap_hucs_to_corridors_tol : float = 10.0,
                           **kwargs) -> \
                        watershed_workflow.mesh.mesh.Mesh2D | \
                        Tuple[watershed_workflow.mesh.mesh.Mesh2D, np.ndarray, np.ndarray]:
@@ -666,6 +667,13 @@ def tessalateRiverAligned(hucs : Watershed,
     ax : matplotlib Axes object, optional
        For debugging -- plots troublesome reaches as quad elements are
        generated to find tricky areas.
+    snap_hucs_to_corridors_tol : float, optional
+       HUC boundary vertices within this distance (CRS units) of a river
+       corridor are snapped onto the corridor's own vertices before
+       triangulation, so that boundaries running alongside a corridor do
+       not leave thin gaps that fill with tiny cells (see
+       mesh.river_mesh.snapHUCsToCorridors()).  Default 10.  Set to 0 to
+       disable.
     kwargs :
        All other arguments are passed to the triangulation function for refinement.
 
@@ -705,7 +713,12 @@ def tessalateRiverAligned(hucs : Watershed,
 
     if intersections is not None or not triangulate:
         return river_coords, river_elems, intersections
-        
+
+    # make HUC boundaries running alongside corridors follow the corridor edge
+    if snap_hucs_to_corridors_tol > 0:
+        watershed_workflow.mesh.river_mesh.snapHUCsToCorridors(hucs, river_corridors,
+                                                               snap_hucs_to_corridors_tol)
+
     # triangulate the rest
     if internal_boundaries is None:
         internal_boundaries = river_corridors
