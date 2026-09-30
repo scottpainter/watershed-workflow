@@ -79,3 +79,52 @@ def test_exterior_boundary_never_snapped():
     before = {h: list(ls.coords) for h, ls in hucs.linestrings.items()}
     assert snapHUCsToCorridors(hucs, [corridor, ], tol=5.) == []
     assert {h: list(ls.coords) for h, ls in hucs.linestrings.items()} == before
+
+
+#
+# snapCorridorsToExterior / matchRiverVertices
+#
+from watershed_workflow.mesh.river_mesh import snapCorridorsToExterior, matchRiverVertices
+
+
+def _box_domain():
+    """One HUC [0,100]x[0,100]; its exterior boundary is the only linestring."""
+    poly = shapely.geometry.Polygon([(0., 0.), (100., 0.), (100., 100.), (0., 100.)])
+    return watershed_workflow.hydro.watershed.Watershed(geopandas.GeoDataFrame(geometry=[poly]))
+
+
+def test_corridor_vertex_near_exterior_moves_onto_it():
+    hucs = _box_domain()
+    # corridor leaving through the bottom edge; its vertex (30, 2) is 2 m inside
+    coords = np.array([[40., 0.], [30., 2.], [30., 40.], [38., 40.]])
+    corridors = [shapely.geometry.Polygon(coords)]
+    corridors, moves = snapCorridorsToExterior(hucs, coords, corridors, tol=5.)
+
+    assert len(moves) == 1 and moves[0]['index'] == 1
+    assert np.allclose(coords[1], (30., 0.))                       # projected onto the edge
+    assert np.allclose(coords[0], (40., 0.))                       # already on the boundary: unchanged
+    assert np.allclose(coords[2:], [[30., 40.], [38., 40.]])       # far from the boundary: unchanged
+    assert (30., 0.) in [tuple(c) for c in corridors[0].exterior.coords]
+    boundary = shapely.ops.unary_union(list(hucs.linestrings.values()))
+    assert any(np.allclose(c[0:2], (30., 0.)) for ls in hucs.linestrings.values() for c in ls.coords)
+    assert boundary.length == pytest.approx(400.)                  # the domain boundary did not move
+
+
+def test_corridor_vertex_snaps_to_nearby_boundary_vertex():
+    hucs = _box_domain()
+    # (99.4, 0.5) projects to (99.4, 0), which is within 1 m of the existing
+    # boundary vertex (100, 0), so the corridor vertex goes onto that vertex
+    coords = np.array([[99.4, 0.5], [60., 20.], [60., 40.]])
+    snapCorridorsToExterior(hucs, coords, [shapely.geometry.Polygon(coords)], tol=5.)
+    assert np.allclose(coords[0], (100., 0.))
+
+
+def test_match_river_vertices_handles_dropped_and_reordered_vertices():
+    river_coords = np.array([[0., 0.], [1., 0.], [1., 1.], [0., 1.]])
+    elems = [[0, 1, 2, 3]]
+    # the triangulation dropped (0, 0) and put the others in a different order
+    tri_coords = np.array([[5., 5.], [1., 1.], [0., 1.], [1., 0.]])
+    coords, new_elems, n = matchRiverVertices(tri_coords, river_coords, elems, [])
+    assert n == 1
+    assert len(coords) == 5
+    assert np.allclose(coords[new_elems[0]], river_coords)

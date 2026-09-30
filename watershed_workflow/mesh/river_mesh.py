@@ -2,6 +2,7 @@
 from typing import Callable, List, Tuple, Dict, Optional
 
 import numpy as np
+import scipy.spatial
 import pandas as pd
 import logging
 
@@ -24,6 +25,8 @@ import watershed_workflow.sources.standard_names as names
 __all__ = [
     'createRiversMesh',
     'snapHUCsToCorridors',
+    'snapCorridorsToExterior',
+    'matchRiverVertices',
 ]
 
 
@@ -697,6 +700,145 @@ def snapHUCsToCorridors(hucs: Watershed,
                  f'{len(report)} HUC linestrings to river corridors (tol = {tol})')
     return report
 
+
+
+def snapCorridorsToExterior(hucs: Watershed,
+                            coords: np.ndarray,
+                            corridors: List[shapely.geometry.Polygon],
+                            tol: float,
+                            vertex_tol: float = 1.0) -> Tuple[List[shapely.geometry.Polygon], List[Dict]]:
+    """Move river-corridor vertices that lie just inside the domain boundary onto it.
+
+    Where the domain's exterior boundary runs within a few metres of a
+    corridor edge (typically right at the domain outlet, next to the
+    corridor corner that adjustHUCsToRiverMesh() put on the boundary), the
+    sliver of land between them becomes one or more tiny cells.  Each
+    corridor vertex within tol of an exterior HUC linestring (but not
+    already on it) is moved onto that linestring: onto an existing boundary
+    vertex if within vertex_tol of one (the triangulation rejects distinct
+    vertices closer than that), otherwise onto its projection, which is
+    inserted into the linestring.  The exterior boundary itself does not
+    move.
+
+    Afterwards a corridor vertex may have no land triangle next to it;
+    tessalateRiverAligned() handles that by matching river vertices to the
+    triangulation's output by coordinate.
+
+    Must be called after createRiversMesh() and before triangulation.
+
+    Parameters
+    ----------
+    hucs : Watershed
+        Split HUCs object; its exterior linestrings are modified in place.
+    coords : np.ndarray
+        River corridor coordinates returned by createRiversMesh(); modified
+        in place.
+    corridors : List[shapely.geometry.Polygon]
+        River corridor polygons returned by createRiversMesh().
+    tol : float
+        Distance within which a corridor vertex is moved, in CRS units.
+    vertex_tol : float, optional
+        Snap to an existing boundary vertex rather than inserting a new one
+        if within this distance.
+
+    Returns
+    -------
+    corridors : List[shapely.geometry.Polygon]
+        Corridor polygons rebuilt with the moved vertices.
+    moves : List[dict]
+        One entry per moved vertex: index, old, new, distance, handle.
+    """
+    exterior_handles = [h for spine in hucs.boundaries.values() for h in spine.values()]
+    exterior = shapely.ops.unary_union([hucs.linestrings[h] for h in exterior_handles])
+
+    moves = []
+    for i in range(len(coords)):
+        p = shapely.geometry.Point(coords[i][0:2])
+        if exterior.distance(p) >= tol:
+            continue
+        handle = min(exterior_handles, key=lambda h: hucs.linestrings[h].distance(p))
+        ls = hucs.linestrings[handle]
+        d = ls.distance(p)
+        if d < 1.e-6:
+            continue
+
+        ls_coords = [tuple(c[0:2]) for c in ls.coords]
+        s = ls.project(p)
+        q = ls.interpolate(s)
+        nearest = min(range(len(ls_coords)), key=lambda k: shapely.geometry.Point(ls_coords[k]).distance(q))
+        if shapely.geometry.Point(ls_coords[nearest]).distance(q) < vertex_tol:
+            new_c = ls_coords[nearest]
+        else:
+            new_c = (q.x, q.y)
+            arclen = 0.
+            for k in range(len(ls_coords) - 1):
+                seg_len = shapely.geometry.Point(ls_coords[k]).distance(shapely.geometry.Point(ls_coords[k+1]))
+                if arclen + seg_len >= s:
+                    ls_coords.insert(k + 1, new_c)
+                    break
+                arclen += seg_len
+            hucs.linestrings[handle] = shapely.geometry.LineString(ls_coords)
+
+        moves.append(dict(index=i, old=tuple(coords[i][0:2]), new=new_c, distance=d, handle=handle))
+        coords[i][0] = new_c[0]
+        coords[i][1] = new_c[1]
+
+    if len(moves) > 0:
+        old_to_new = { tuple(np.round(m['old'], 6)) : m['new'] for m in moves }
+        def _update(ring):
+            return [old_to_new.get(tuple(np.round(c[0:2], 6)), tuple(c[0:2])) for c in ring.coords]
+        corridors = [shapely.geometry.Polygon(_update(c.exterior), [_update(r) for r in c.interiors])
+                     for c in corridors]
+    logging.info(f'snapCorridorsToExterior: moved {len(moves)} corridor vertices onto the '
+                 f'domain boundary (tol = {tol})')
+    return corridors, moves
+
+
+def matchRiverVertices(tri_coords: np.ndarray,
+                       coords: np.ndarray,
+                       elems: List[List[int]],
+                       rivers: List[River],
+                       tol: float = 1.e-3) -> Tuple[np.ndarray, List[List[int]], int]:
+    """Re-index the river elements into the triangulation's vertices.
+
+    The river elements index the corridor coordinates returned by
+    createRiversMesh().  The triangulation lists those vertices first, but
+    Triangle (as called by meshpy) drops any input vertex that is in no
+    triangle -- e.g. a corridor corner with no land next to it on the
+    domain boundary -- and renumbers every later vertex.  This finds each
+    corridor vertex in the triangulation by coordinate, appends any that
+    were dropped, and re-indexes the river elements (both elems and each
+    reach's names.ELEMS) accordingly.
+
+    Returns
+    -------
+    coords : np.ndarray
+        The triangulation's vertices plus any appended corridor vertices.
+    elems : List[List[int]]
+        River elements indexing coords.
+    n_appended : int
+        Number of corridor vertices the triangulation had dropped.
+    """
+    tri_coords = np.asarray(tri_coords)
+    coords = np.asarray(coords)
+    tree = scipy.spatial.cKDTree(tri_coords[:, 0:2])
+    dist, index = tree.query(coords[:, 0:2])
+    index = np.where(dist < tol, index, -1)
+
+    missing = np.where(index < 0)[0]
+    if len(missing) > 0:
+        extra = np.zeros((len(missing), tri_coords.shape[1]))
+        n = min(tri_coords.shape[1], coords.shape[1])
+        extra[:, 0:n] = coords[missing, 0:n]
+        index[missing] = len(tri_coords) + np.arange(len(missing))
+        tri_coords = np.vstack([tri_coords, extra])
+        logging.info(f'matchRiverVertices: re-added {len(missing)} corridor vertices dropped by the triangulation')
+
+    new_elems = [[int(index[v]) for v in e] for e in elems]
+    for river in rivers:
+        for reach in river:
+            reach[names.ELEMS][:] = [[int(index[v]) for v in e] for e in reach[names.ELEMS]]
+    return tri_coords, new_elems, len(missing)
 
 def computeLine(p1: np.ndarray, p2: np.ndarray) -> Tuple[float, float, float]:
     """Compute line coefficients (Ax + By + C = 0) for a line defined by two points.
