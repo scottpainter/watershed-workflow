@@ -451,9 +451,9 @@ def smoothUpstreamSharpAngles(hucs : Watershed | None,
     if zipper_angle > 0:
         for i in range(1, len(touches)-1):
             if touches[i][0] < 0 and touches[i+1][0] < 0 and angles[i] < zipper_angle:
-                _zipperSiblings([reach.children[-touches[i][0]-1], reach.children[-touches[i+1][0]-1]], zipper_angle)
-                # changed the graph, try again
-                return 1 + smoothUpstreamSharpAngles(hucs, reach, min_angle, zipper_angle)
+                if _zipperSiblings([reach.children[-touches[i][0]-1], reach.children[-touches[i+1][0]-1]], zipper_angle):
+                    # changed the graph, try again
+                    return 1 + smoothUpstreamSharpAngles(hucs, reach, min_angle, zipper_angle)
 
     # done zippering, now spread
     count, linestrings, new_angles = _spreadAngles(linestrings, min_angle)
@@ -564,58 +564,108 @@ def smoothHUCsSharpAngles(hucs : Watershed,
 
 
 def _zipperSiblings(reaches : List[River],
-                   min_angle : float):
-    """This function assumes that the list of reaches are siblings,
-    share a common endpoint, and the angle between their linestrings
-    as they leave the endpoint is less than min_angle.
+                   min_angle : float) -> bool:
+    """Move a sharp confluence upstream by merging its sibling reaches.
 
-    It then chomps from the endpoint, removing point by point until
-    one of the angles is greater than min_angle.
+    This function assumes that the list of reaches are siblings, share
+    a common endpoint, and that the angle between (some pair of) their
+    linestrings as they leave the endpoint is less than min_angle.
+
+    It then chomps from the endpoint, replacing the siblings' last
+    points by their centroid point by point, until the smallest angle
+    between the siblings is at least min_angle, or until a sibling has
+    no more points to give.  The chomped points become a new reach
+    downstream of the new confluence.
+
+    The new reach takes the identity of the main branch (the sibling
+    that the downstream reach names as its upstream hydroseq, else the
+    one with the largest drainage area), with the siblings' combined
+    drainage area, the Strahler order of the siblings, and a hydroseq
+    between the downstream reach and the siblings.
 
     Note this assumes that all reaches have been discretized, and with
     a fairly consistent ds.
+
+    Returns True if the river was changed, False if there was nothing to
+    zipper (the siblings already meet at min_angle or more, or a sibling
+    has no points to spare).
     """
     logging.info(f'-- zippering children at reach: {reaches[0].parent.index}')
 
     assert len(reaches) > 1
+    parent = reaches[0].parent
     linestrings = [r.linestring for r in reaches]
-    
+
     for ls in linestrings:
         assert watershed_workflow.utils.geometry.isClose(reaches[0].linestring.coords[-1], ls.coords[-1])
-    
-    # chomp the reaches until max of angles > min_angle
+
     angles = _getAngles(linestrings)
-    assert max(angles) > min_angle
-    
+    if min(angles) >= min_angle:
+        logging.info(f'   siblings already meet at {min(angles):.1f} >= {min_angle} degrees; nothing to zipper')
+        return False
+
+    # the main branch goes first, so that the merged reach takes its identity
+    def _isMain(r):
+        if names.UPSTREAM_HYDROSEQ in parent and names.HYDROSEQ in r:
+            return r[names.HYDROSEQ] == parent[names.UPSTREAM_HYDROSEQ]
+        return False
+    def _drainage(r):
+        return r[names.DRAINAGE_AREA] if names.DRAINAGE_AREA in r else 0.
+    order = sorted(range(len(reaches)), key=lambda k: (not _isMain(reaches[k]), -_drainage(reaches[k])))
+    reaches = [reaches[k] for k in order]
+    linestrings = [linestrings[k] for k in order]
+
+    # chomp the reaches until the smallest angle between them is at least min_angle
     new_coords = [linestrings[0].coords[-1],]
-    done = False
     count = 0
-    while not done:
+    while True:
+        if any(len(ls.coords) < 3 for ls in linestrings):
+            logging.info('   a sibling has no more points to zipper; stopping')
+            break
         centroid = np.mean([ls.coords[-2] for ls in linestrings], axis=0)
         new_coords.append(centroid)
         count += 1
         linestrings = [shapely.geometry.LineString(ls.coords[:-2]+[centroid,]) for ls in linestrings]
+        if min(_getAngles(linestrings)) >= min_angle:
+            break
 
-        if any(len(ls.coords) == 1 for ls in linestrings):
-            done = True
-        else:
-            angles = _getAngles(linestrings)
-            if max(angles) > min_angle:
-                done = True
-
+    if count == 0:
+        return False
     logging.info(f'   zipper up {count} segments to {centroid}')
-                
+
     new_downstream_ls = shapely.geometry.LineString(reversed(new_coords))
     logging.info(f'   introducing a new reach of length {new_downstream_ls.length} with {len(new_downstream_ls.coords)} coords')
 
-    old_downstream_nodes = []
+    upstream_nodes = []
     merged_ds_node = None
     for reach, ls in zip(reaches, linestrings):
         us, ds = reach.split(len(ls.coords)-1)
         us.moveCoordinate(-1, centroid)
-        old_downstream_nodes.append(ds)
+        upstream_nodes.append(us)
 
         if merged_ds_node is None:
             merged_ds_node = ds
         else:
             merged_ds_node = watershed_workflow.hydro.river.combineSiblings(merged_ds_node, ds, new_downstream_ls)
+
+    # properties of the merged reach, downstream of the new confluence
+    if names.DRAINAGE_AREA in merged_ds_node:
+        merged_ds_node[names.DRAINAGE_AREA] = sum(_drainage(r) for r in upstream_nodes)
+    if names.ORDER in merged_ds_node:
+        orders = [r[names.ORDER] for r in upstream_nodes]
+        top = max(orders)
+        merged_ds_node[names.ORDER] = top + 1 if orders.count(top) > 1 else top
+    if names.HYDROSEQ in merged_ds_node and names.HYDROSEQ in parent:
+        hs = (parent[names.HYDROSEQ] + min(r[names.HYDROSEQ] for r in upstream_nodes)) / 2.0
+        merged_ds_node[names.HYDROSEQ] = hs
+        if names.DOWNSTREAM_HYDROSEQ in merged_ds_node:
+            merged_ds_node[names.DOWNSTREAM_HYDROSEQ] = parent[names.HYDROSEQ]
+        if names.UPSTREAM_HYDROSEQ in merged_ds_node:
+            merged_ds_node[names.UPSTREAM_HYDROSEQ] = upstream_nodes[0][names.HYDROSEQ]
+        for r in upstream_nodes:
+            if names.DOWNSTREAM_HYDROSEQ in r:
+                r[names.DOWNSTREAM_HYDROSEQ] = hs
+        if names.UPSTREAM_HYDROSEQ in parent and \
+           parent[names.UPSTREAM_HYDROSEQ] in [r[names.HYDROSEQ] for r in upstream_nodes]:
+            parent[names.UPSTREAM_HYDROSEQ] = hs
+    return True
