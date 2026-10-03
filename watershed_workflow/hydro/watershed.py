@@ -525,7 +525,31 @@ def offsetDivideFromReaches(hucs : gpd.GeoDataFrame,
     out.at[i_keep, 'geometry'] = new_keep
     out.at[i_other, 'geometry'] = new_other
 
-    divide = new_keep.exterior.intersection(new_other.exterior)
+    # Where the divide now meets a third HUC part way along one of its edges
+    # (a triple junction that slid), the new corner is a vertex of keep and
+    # other but not of the third HUC, and sits up to a grid cell off its edge.
+    # Insert it there too, or the shared edges are not noded alike and
+    # Watershed() finds slivers of overlap.
+    old_vertices = set(keep_poly.exterior.coords) | set(other_poly.exterior.coords)
+    new_vertices = [c for c in set(new_keep.exterior.coords) | set(new_other.exterior.coords)
+                    if c not in old_vertices]
+    if len(new_vertices) > 0:
+        snap_tol = 10 * grid
+        for i in out.index:
+            if i in (i_keep, i_other):
+                continue
+            poly = out.at[i, 'geometry']
+            near = [c for c in new_vertices
+                    if shapely.geometry.Point(c).distance(poly.exterior) < snap_tol
+                    and c not in set(poly.exterior.coords)]
+            if len(near) > 0:
+                snapped = shapely.snap(poly, shapely.geometry.MultiPoint(near), snap_tol)
+                if not (isinstance(snapped, shapely.geometry.Polygon) and snapped.is_valid):
+                    raise RuntimeError(f'offsetDivideFromReaches: inserting the new junction into HUC '
+                                       f'{out.at[i, id_col]} made it invalid')
+                out.at[i, 'geometry'] = snapped
+
+    divide =new_keep.exterior.intersection(new_other.exterior)
     path = shapely.ops.unary_union(list(reaches.geometry))
     crossings = path.intersection(divide)
     report = dict(area_moved=strip.area,

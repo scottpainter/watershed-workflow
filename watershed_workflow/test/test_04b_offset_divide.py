@@ -68,3 +68,22 @@ def test_splitting_the_other_huc_raises():
     # a reach of A crossing all of B would cut B in two large pieces
     with pytest.raises(RuntimeError):
         ww.offsetDivideFromReaches(_hucs(), _reaches([(90, 50), (210, 50)]), 'A', 'B', 10.)
+
+
+def test_slid_triple_junction_is_noded_in_the_third_huc():
+    # the clearance reaches the A|B|C junction at (100, 100), so the junction
+    # slides along C's edge; C must get the new corner as a vertex, and the
+    # result must build a Watershed
+    import watershed_workflow
+    hucs = _hucs()
+    out, _ = ww.offsetDivideFromReaches(hucs, _reaches([(98, 10), (98, 40), (101, 50), (98, 60), (98.3, 97.1)]),
+                                        'A', 'B', 10.)
+    a, b, c = out.geometry
+    c_vertices = set(c.exterior.coords)
+    on_c = [p for p in set(a.exterior.coords) | set(b.exterior.coords)
+            if shapely.geometry.Point(p).distance(c.exterior) < 1e-6]
+    assert any(p not in set(hucs.geometry[2].exterior.coords) for p in on_c)   # the junction did slide
+    assert all(p in c_vertices for p in on_c)
+    for p, q in ((a, c), (b, c)):
+        assert p.intersection(q).area == 0.
+    watershed_workflow.Watershed(out)
