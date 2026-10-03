@@ -24,6 +24,8 @@ import watershed_workflow.sources.standard_names as names
 
 __all__ = [
     'createRiversMesh',
+    'computeWidthByOrder',
+    'widthByOrderFunction',
     'snapHUCsToCorridors',
     'snapCorridorsToExterior',
     'matchRiverVertices',
@@ -125,6 +127,58 @@ def _plotRiver(river: River,
 
     elems.boundary.plot(ax=ax, color='g')#, marker='x')
     # watershed_workflow.plot.plot.linestringsWithCoords(elems.boundary, color='g', marker='x', ax=ax)
+
+
+def computeWidthByOrder(rivers : gpd.GeoDataFrame | List[River],
+                        order_col : str = names.ORDER,
+                        width_col : str = names.BANKFULL_WIDTH,
+                        statistic : str = 'mean') -> Dict[int, float]:
+    """Corridor width for each stream order, from the reaches' own channel widths.
+
+    Summarizes width_col (bankfull width by default) over all reaches of each
+    stream order, so that a width-by-order corridor is consistent with the
+    channel data rather than with a hand-chosen table.  Use with
+    widthByOrderFunction() to build the river_width argument of
+    tessalateRiverAligned().
+
+    Parameters
+    ----------
+    rivers : gpd.GeoDataFrame or List[River]
+        Reaches with order_col and width_col properties.
+    order_col, width_col : str, optional
+        Property names of the stream order and width.
+    statistic : str, optional
+        A pandas groupby aggregation, e.g. 'mean' (default) or 'median'.
+
+    Returns
+    -------
+    Dict[int, float]
+        Width for each stream order present.
+    """
+    if isinstance(rivers, gpd.GeoDataFrame):
+        df = rivers
+    else:
+        df = pd.DataFrame([{order_col : reach[order_col], width_col : reach[width_col]}
+                           for river in rivers for reach in river])
+    widths = df.groupby(order_col)[width_col].agg(statistic)
+    return { int(order) : float(width) for order, width in widths.items() }
+
+
+def widthByOrderFunction(width_by_order : Dict[int, float],
+                         order_col : str = names.ORDER) -> Callable[[River], float]:
+    """A river_width callable for createRiversMesh() / tessalateRiverAligned().
+
+    Returns width_by_order[reach[order_col]]; a reach whose order is not in
+    the table gets the width of the nearest order that is.
+    """
+    orders = sorted(width_by_order.keys())
+
+    def riverWidth(reach : River) -> float:
+        order = reach[order_col]
+        if order in width_by_order:
+            return width_by_order[order]
+        return width_by_order[min(orders, key=lambda o: abs(o - order))]
+    return riverWidth
 
 
 def createRiversMesh(hucs : Watershed,

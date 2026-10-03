@@ -1,5 +1,5 @@
 """A module for working with multi-polys, a MultiLine that together forms a Polygon"""
-from typing import Optional, Tuple, List, Iterable, Any, Sequence
+from typing import Optional, Tuple, List, Iterable, Any, Sequence, Callable
 
 import logging
 import numpy as np
@@ -12,6 +12,7 @@ import folium
 import folium.plugins
 import geopandas as gpd
 
+import shapely
 import shapely.geometry
 import shapely.ops
 import shapely.errors
@@ -25,6 +26,7 @@ import watershed_workflow.sources.standard_names as names
 __all__ = [
     'Watershed',
     'simplify',
+    'offsetDivideFromReaches',
     'removeHoles',
     'partition',
     'intersectAndSplit',
@@ -411,6 +413,128 @@ def simplify(hucs : Watershed,
     """Simplify, IN PLACE, all linestrings in the polygon representation."""
     for i, linestring in hucs.linestrings.items():
         hucs.linestrings[i] = linestring.simplify(tol)
+
+
+def offsetDivideFromReaches(hucs : gpd.GeoDataFrame,
+                            reaches : gpd.GeoDataFrame,
+                            keep : Any,
+                            other : Any,
+                            clearance : float | Callable[[Any], float],
+                            id_col : str = names.ID,
+                            max_fragment_frac : float = 0.005,
+                            grid : float = 1.e-3) -> Tuple[gpd.GeoDataFrame, dict]:
+    """Move the divide between two HUCs away from reaches that belong to one of them.
+
+    Watershed Workflow's snapping (snapHUCsJunctions, snapReachEndpoints,
+    cutAndSnapCrossings) moves HUC boundaries onto rivers; this moves a
+    divide away from them.  Use it before building a Watershed when a reach
+    of HUC `keep` was digitized along its divide with HUC `other` -- running
+    coincident with it and/or crossing it back and forth, which makes
+    simplify() fail to cut and snap the crossings -- or when a tip of `other`
+    wraps around or across a reach of `keep`.
+
+    Every part of `other` within the clearance of any of the reaches is
+    transferred to `keep`.  The resulting divide is the reaches offset by the
+    clearance wherever the original divide was closer than that, and the
+    original divide everywhere else; triple junctions with other HUCs slide
+    along their edges.  Only the parts of the reaches lying in `keep` or
+    `other` are used, so a reach continuing into a third HUC claims nothing
+    there.  Pieces of `other` cut off by the transfer (in total at most
+    max_fragment_frac of its area) also go to `keep`.
+
+    All HUC geometries are snapped to a common grid first, so that shared
+    edges -- including those with HUCs not being edited -- stay exactly
+    coincident.
+
+    Parameters
+    ----------
+    hucs : gpd.GeoDataFrame
+        HUC polygons.
+    reaches : gpd.GeoDataFrame
+        The reaches to keep the divide away from.
+    keep, other : Any
+        id_col values of the HUC that keeps the reaches (and grows) and of
+        the HUC that gives up area.
+    clearance : float or Callable
+        Distance to keep the divide from the reaches, in CRS units; or a
+        function of a reaches row returning it (e.g. a multiple of the
+        reach's corridor width).
+    id_col : str, optional
+        Column of hucs identifying each HUC.
+    max_fragment_frac : float, optional
+        Largest total area, as a fraction of `other`, of detached pieces
+        that may be absorbed into `keep`.
+    grid : float, optional
+        Precision grid, in CRS units, for all HUC geometries.
+
+    Returns
+    -------
+    hucs : gpd.GeoDataFrame
+        A copy of hucs with the two polygons modified.
+    report : dict
+        area_moved, detached_fragments, fraction_of_other,
+        min_reach_to_divide, reach_crossings.
+
+    Raises
+    ------
+    RuntimeError
+        If either polygon would become invalid, multipart or holed, or the
+        detached area exceeds max_fragment_frac.
+    """
+    clearance_fn = clearance if callable(clearance) else (lambda reach: clearance)
+
+    out = hucs.copy()
+    out['geometry'] = shapely.set_precision(out.geometry.values, grid)
+    i_keep = out.index[out[id_col] == keep][0]
+    i_other = out.index[out[id_col] == other][0]
+    keep_poly = out.at[i_keep, 'geometry']
+    other_poly = out.at[i_other, 'geometry']
+    both = keep_poly.union(other_poly)
+
+    pieces = []
+    for _, reach in reaches.iterrows():
+        g = reach.geometry.intersection(both)
+        if not g.is_empty:
+            pieces.append(g.buffer(clearance_fn(reach), quad_segs=8))
+    strip = shapely.set_precision(shapely.ops.unary_union(pieces), grid).intersection(other_poly) \
+        if len(pieces) > 0 else shapely.geometry.Polygon()
+    if strip.area == 0.:
+        logging.info(f'offsetDivideFromReaches {keep}|{other}: no part of {other} is within the clearance')
+        return out, dict(area_moved=0., detached_fragments=0, fraction_of_other=0.,
+                         min_reach_to_divide=None, reach_crossings=None)
+
+    new_other = other_poly.difference(strip)
+    fragments = []
+    if new_other.geom_type == 'MultiPolygon':
+        parts = sorted(new_other.geoms, key=lambda g: -g.area)
+        fragments = parts[1:]
+        fragment_area = sum(g.area for g in fragments)
+        if fragment_area > max_fragment_frac * other_poly.area:
+            raise RuntimeError(f'offsetDivideFromReaches: HUC {other} would be split; the detached '
+                               f'area {fragment_area:g} exceeds {max_fragment_frac:.1%} of the HUC')
+        new_other = parts[0]
+        strip = shapely.ops.unary_union([strip, ] + fragments)
+
+    # (both - new_other) rather than keep.union(strip), so that the new shared
+    # edge is exactly the same line in both polygons
+    new_keep = both.difference(new_other)
+    for huc_id, poly in ((keep, new_keep), (other, new_other)):
+        if not (isinstance(poly, shapely.geometry.Polygon) and poly.is_valid and len(poly.interiors) == 0):
+            raise RuntimeError(f'offsetDivideFromReaches: HUC {huc_id} would become a {poly.geom_type} '
+                               f'(valid={poly.is_valid}, holes={len(getattr(poly, "interiors", []))})')
+    out.at[i_keep, 'geometry'] = new_keep
+    out.at[i_other, 'geometry'] = new_other
+
+    divide = new_keep.exterior.intersection(new_other.exterior)
+    path = shapely.ops.unary_union(list(reaches.geometry))
+    crossings = path.intersection(divide)
+    report = dict(area_moved=strip.area,
+                  detached_fragments=len(fragments),
+                  fraction_of_other=strip.area / other_poly.area,
+                  min_reach_to_divide=path.distance(divide),
+                  reach_crossings=0 if crossings.is_empty else len(getattr(crossings, 'geoms', [crossings, ])))
+    logging.info(f'offsetDivideFromReaches {keep}|{other}: {report}')
+    return out, report
 
 
 def removeHoles(polygons : Iterable[shapely.geometry.Polygon],
