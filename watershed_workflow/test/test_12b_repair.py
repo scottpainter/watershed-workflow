@@ -151,3 +151,11 @@ def test_huc_pair_sharing_two_stretches_is_reported_not_plotted():
     report = diag.findDefects(hucs, _rivers(ONE_STREAM), **KWARGS)
     [d] = report.defects
     assert d.kind == 'watershed' and sorted(d.hucs) == ['A', 'B'] and d.details['stretches'] == 2
+
+
+def test_move_river_node_keeps_reaches_connected():
+    rivers = _rivers([[(0, 0), (10, 0)], [(10, 0), (20, 0)], [(10, 5), (10, 0)]])
+    _, out = repair.moveRiverNode(None, rivers, [10, 0], [10, -3], expected=3)
+    assert out.geometry[0].coords[-1] == out.geometry[1].coords[0] == out.geometry[2].coords[-1] == (10., -3.)
+    with pytest.raises(ValueError):
+        repair.moveRiverNode(None, rivers, [10, 0], [10, -3], expected=2)

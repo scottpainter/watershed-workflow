@@ -87,3 +87,15 @@ def test_slid_triple_junction_is_noded_in_the_third_huc():
     for p, q in ((a, c), (b, c)):
         assert p.intersection(q).area == 0.
     watershed_workflow.Watershed(out)
+
+
+def test_flat_caps_keep_an_outlet_on_the_divide():
+    # a reach of A that ends at A's outlet on the A|B divide
+    hucs = _hucs()
+    outlet = shapely.geometry.Point(100, 50)
+    reaches = _reaches([(98, 10), (97, 40), (100, 50)])
+    flat, rep = ww.offsetDivideFromReaches(hucs, reaches, 'A', 'B', 10., cap_style='flat')
+    rnd, _ = ww.offsetDivideFromReaches(hucs, reaches, 'A', 'B', 10.)
+    assert rep['area_moved'] > 0
+    assert flat.geometry[0].boundary.distance(outlet) < 1e-6      # still the outlet
+    assert rnd.geometry[0].boundary.distance(outlet) > 5.         # round caps wrap it

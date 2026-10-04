@@ -60,7 +60,7 @@ import watershed_workflow.sources.standard_names as names
 from watershed_workflow.diagnostics import Defect, DefectReport
 
 __all__ = ['Proposal', 'Recipe', 'proposeFixes', 'applyRecipe', 'ACTIONS', 'PROPOSERS',
-           'dropEmptyReaches', 'dropReaches', 'offsetDivide', 'splitHUC',
+           'dropEmptyReaches', 'dropReaches', 'offsetDivide', 'splitHUC', 'moveRiverNode',
            'straightNeckCuts', 'equidistantCut']
 
 Frames = Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]
@@ -133,18 +133,56 @@ def offsetDivide(hucs : gpd.GeoDataFrame,
                  reaches : List[Any],
                  clearance : Dict[str, float],
                  id_col : str = names.ID,
-                 huc_id_col : str = names.ID) -> Frames:
+                 huc_id_col : str = names.ID,
+                 cap_style : str = 'round') -> Frames:
     """hydro.watershed.offsetDivideFromReaches() with a per-reach clearance table.
 
     clearance maps each reach ID (as a string) to its clearance, so the step
-    replays exactly however the rivers change before it.
+    replays exactly however the rivers change before it.  cap_style='flat'
+    keeps the divide through an outlet the reaches end at.
     """
     sel = rivers[rivers[id_col].astype(str).isin([str(r) for r in reaches])]
     if len(sel) != len(reaches):
         raise ValueError(f'offsetDivide: reaches {reaches} not all found')
     hucs, _ = watershed_workflow.hydro.watershed.offsetDivideFromReaches(
-        hucs, sel, keep, other, lambda row: clearance[str(row[id_col])], id_col=huc_id_col)
+        hucs, sel, keep, other, lambda row: clearance[str(row[id_col])], id_col=huc_id_col,
+        cap_style=cap_style)
     return hucs, rivers
+
+
+def moveRiverNode(hucs : gpd.GeoDataFrame,
+                  rivers : gpd.GeoDataFrame,
+                  point_from : List[float],
+                  point_to : List[float],
+                  tol : float = 1.e-3,
+                  expected : Optional[int] = None) -> Frames:
+    """Move a node of the river network (a confluence, or a reach end) to a new point.
+
+    Every reach endpoint within tol of point_from is moved to point_to, so
+    the reaches meeting there stay connected.  Use it, e.g., to snap a
+    confluence that lies just inside a HUC onto the divide, making it the
+    HUC's outlet.  If expected is given, exactly that many reach ends must
+    be moved.
+    """
+    a = np.array(point_from[0:2], dtype=float)
+    out = rivers.copy()
+    moved = 0
+    for i in out.index:
+        g = out.at[i, 'geometry']
+        if g is None or g.is_empty:
+            continue
+        cs = [list(c) for c in g.coords]
+        changed = False
+        for k in (0, -1):
+            if np.linalg.norm(np.array(cs[k][0:2]) - a) < tol:
+                cs[k][0:2] = list(point_to[0:2])
+                changed = True
+                moved += 1
+        if changed:
+            out.at[i, 'geometry'] = shapely.geometry.LineString(cs)
+    if moved == 0 or (expected is not None and moved != expected):
+        raise ValueError(f'moveRiverNode: moved {moved} reach ends at {point_from}, expected {expected}')
+    return hucs, out
 
 
 def splitHUC(hucs : gpd.GeoDataFrame,
@@ -160,6 +198,7 @@ ACTIONS : Dict[str, Callable[..., Frames]] = {
     'dropReaches' : dropReaches,
     'offsetDivide' : offsetDivide,
     'splitHUC' : splitHUC,
+    'moveRiverNode' : moveRiverNode,
 }
 
 

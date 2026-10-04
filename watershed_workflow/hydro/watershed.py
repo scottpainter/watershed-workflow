@@ -457,7 +457,8 @@ def offsetDivideFromReaches(hucs : gpd.GeoDataFrame,
                             clearance : float | Callable[[Any], float],
                             id_col : str = names.ID,
                             max_fragment_frac : float = 0.005,
-                            grid : float = 1.e-3) -> Tuple[gpd.GeoDataFrame, dict]:
+                            grid : float = 1.e-3,
+                            cap_style : str = 'round') -> Tuple[gpd.GeoDataFrame, dict]:
     """Move the divide between two HUCs away from reaches that belong to one of them.
 
     Watershed Workflow's snapping (snapHUCsJunctions, snapReachEndpoints,
@@ -501,6 +502,11 @@ def offsetDivideFromReaches(hucs : gpd.GeoDataFrame,
         that may be absorbed into `keep`.
     grid : float, optional
         Precision grid, in CRS units, for all HUC geometries.
+    cap_style : str, optional
+        End caps of the clearance around each reach: 'round' (default) or
+        'flat'.  Use 'flat' when the reaches end at an outlet on the divide
+        (e.g. a confluence that is the HUC's outlet), so that the divide
+        still passes through the outlet instead of bulging around it.
 
     Returns
     -------
@@ -530,7 +536,7 @@ def offsetDivideFromReaches(hucs : gpd.GeoDataFrame,
     for _, reach in reaches.iterrows():
         g = reach.geometry.intersection(both)
         if not g.is_empty:
-            pieces.append(g.buffer(clearance_fn(reach), quad_segs=8))
+            pieces.append(g.buffer(clearance_fn(reach), quad_segs=8, cap_style=cap_style))
     strip = shapely.set_precision(shapely.ops.unary_union(pieces), grid).intersection(other_poly) \
         if len(pieces) > 0 else shapely.geometry.Polygon()
     if strip.area == 0.:
