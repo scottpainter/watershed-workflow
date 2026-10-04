@@ -10,6 +10,7 @@ from matplotlib import pyplot as plt
 import matplotlib.colors
 import folium
 import folium.plugins
+import pandas as pd
 import geopandas as gpd
 
 import shapely
@@ -27,6 +28,7 @@ __all__ = [
     'Watershed',
     'simplify',
     'offsetDivideFromReaches',
+    'splitHUC',
     'removeHoles',
     'partition',
     'intersectAndSplit',
@@ -415,6 +417,39 @@ def simplify(hucs : Watershed,
         hucs.linestrings[i] = linestring.simplify(tol)
 
 
+def _nodeNewVertices(hucs : gpd.GeoDataFrame,
+                     changed : Sequence[Any],
+                     old_vertices : set,
+                     grid : float,
+                     id_col : str) -> None:
+    """Insert the new corners of edited HUCs into the rings of the other HUCs they lie on.
+
+    A corner created part way along a neighbor's edge (e.g. a triple
+    junction that slid, or the end of a cut) is a vertex of the edited HUCs
+    but not of the neighbor, and after grid snapping sits up to a grid cell
+    off its edge.  Unless it is inserted there too, the shared edges are not
+    noded alike and Watershed() finds slivers of overlap.  Modifies hucs in
+    place.
+    """
+    new_vertices = set(c for i in changed for c in hucs.at[i, 'geometry'].exterior.coords
+                       if c not in old_vertices)
+    if len(new_vertices) == 0:
+        return
+    snap_tol = 10 * grid
+    for i in hucs.index:
+        if i in changed:
+            continue
+        poly = hucs.at[i, 'geometry']
+        own = set(poly.exterior.coords)
+        near = [c for c in new_vertices
+                if c not in own and shapely.geometry.Point(c).distance(poly.exterior) < snap_tol]
+        if len(near) > 0:
+            snapped = shapely.snap(poly, shapely.geometry.MultiPoint(near), snap_tol)
+            if not (isinstance(snapped, shapely.geometry.Polygon) and snapped.is_valid):
+                raise RuntimeError(f'inserting new corners into HUC {hucs.at[i, id_col]} made it invalid')
+            hucs.at[i, 'geometry'] = snapped
+
+
 def offsetDivideFromReaches(hucs : gpd.GeoDataFrame,
                             reaches : gpd.GeoDataFrame,
                             keep : Any,
@@ -526,30 +561,12 @@ def offsetDivideFromReaches(hucs : gpd.GeoDataFrame,
     out.at[i_other, 'geometry'] = new_other
 
     # Where the divide now meets a third HUC part way along one of its edges
-    # (a triple junction that slid), the new corner is a vertex of keep and
-    # other but not of the third HUC, and sits up to a grid cell off its edge.
-    # Insert it there too, or the shared edges are not noded alike and
-    # Watershed() finds slivers of overlap.
-    old_vertices = set(keep_poly.exterior.coords) | set(other_poly.exterior.coords)
-    new_vertices = [c for c in set(new_keep.exterior.coords) | set(new_other.exterior.coords)
-                    if c not in old_vertices]
-    if len(new_vertices) > 0:
-        snap_tol = 10 * grid
-        for i in out.index:
-            if i in (i_keep, i_other):
-                continue
-            poly = out.at[i, 'geometry']
-            near = [c for c in new_vertices
-                    if shapely.geometry.Point(c).distance(poly.exterior) < snap_tol
-                    and c not in set(poly.exterior.coords)]
-            if len(near) > 0:
-                snapped = shapely.snap(poly, shapely.geometry.MultiPoint(near), snap_tol)
-                if not (isinstance(snapped, shapely.geometry.Polygon) and snapped.is_valid):
-                    raise RuntimeError(f'offsetDivideFromReaches: inserting the new junction into HUC '
-                                       f'{out.at[i, id_col]} made it invalid')
-                out.at[i, 'geometry'] = snapped
+    # (a triple junction that slid), the new corner must be a vertex of the
+    # third HUC too.
+    _nodeNewVertices(out, (i_keep, i_other),
+                     set(keep_poly.exterior.coords) | set(other_poly.exterior.coords), grid, id_col)
 
-    divide =new_keep.exterior.intersection(new_other.exterior)
+    divide = new_keep.exterior.intersection(new_other.exterior)
     path = shapely.ops.unary_union(list(reaches.geometry))
     crossings = path.intersection(divide)
     report = dict(area_moved=strip.area,
@@ -558,6 +575,148 @@ def offsetDivideFromReaches(hucs : gpd.GeoDataFrame,
                   min_reach_to_divide=path.distance(divide),
                   reach_crossings=0 if crossings.is_empty else len(getattr(crossings, 'geoms', [crossings, ])))
     logging.info(f'offsetDivideFromReaches {keep}|{other}: {report}')
+    return out, report
+
+
+def splitHUC(hucs : gpd.GeoDataFrame,
+             huc : Any,
+             cut : Sequence[Sequence[float]] | shapely.geometry.LineString,
+             piece_point : Sequence[float] | shapely.geometry.Point,
+             new_id : Any = None,
+             new_tohuc : Any = None,
+             merge_into : Any = None,
+             id_col : str = names.ID,
+             name_suffix : str = '',
+             area_cols : dict = {'areasqkm' : 1.e-6, 'areaacres' : 1. / 4046.8564224},
+             clear_cols : Sequence[str] = ('tnmid', 'globalid'),
+             end_tol : float = 25.,
+             grid : float = 1.e-3) -> Tuple[gpd.GeoDataFrame, dict]:
+    """Split a HUC in two along a cut, making one piece a new HUC or giving it to a neighbor.
+
+    Use when a HUC has more than one outlet: a cut that no reach crosses,
+    separating the networks draining to each outlet, leaves each piece with
+    one.  The cut's ends are moved onto the HUC's boundary, and the new
+    corners there are inserted into any neighboring HUC whose edge they lie
+    on, so that shared edges stay noded alike.  All HUC geometries are
+    snapped to a common grid first, as in offsetDivideFromReaches().
+
+    Parameters
+    ----------
+    hucs : gpd.GeoDataFrame
+        HUC polygons.
+    huc : Any
+        id_col value of the HUC to split.
+    cut : LineString or list of (x, y)
+        The cut, from boundary to boundary of the HUC (a polyline is fine).
+    piece_point : Point or (x, y)
+        A point in the piece to split off.
+    new_id : Any, optional
+        ID of the new HUC.  Required unless merge_into is given.  Every
+        column of the new row holding the old HUC's ID (e.g. huc12 as well
+        as ID) gets new_id.
+    new_tohuc : Any, optional
+        The new HUC's 'tohuc', if hucs has that column.
+    merge_into : Any, optional
+        If given, the piece is added to this HUC instead of becoming a new
+        one; it must share an edge with it.
+    id_col : str, optional
+        Column of hucs identifying each HUC.
+    name_suffix : str, optional
+        Appended to the new HUC's 'name', if hucs has that column.
+    area_cols : dict, optional
+        Area columns to recompute for the changed HUCs, with the factor
+        converting CRS units squared to the column's units.
+    clear_cols : list of str, optional
+        Columns emptied in the new HUC's row (unique identifiers copied from
+        the old one).
+    end_tol : float, optional
+        Largest distance of the cut's ends from the HUC's boundary.
+    grid : float, optional
+        Precision grid, in CRS units, for all HUC geometries.
+
+    Returns
+    -------
+    hucs : gpd.GeoDataFrame
+        A copy of hucs, with the piece as a new last row (or merged).
+    report : dict
+        cut_length, piece_area, remaining_area, and merged_area if merging.
+    """
+    if (new_id is None) == (merge_into is None):
+        raise ValueError('splitHUC: give exactly one of new_id and merge_into')
+
+    out = hucs.copy().reset_index(drop=True)
+    out['geometry'] = shapely.set_precision(out.geometry.values, grid)
+    i = out.index[out[id_col] == huc][0]
+    poly = out.at[i, 'geometry']
+    ring = poly.exterior
+
+    coords = np.array(cut.coords if isinstance(cut, shapely.geometry.LineString) else cut, dtype=float)[:, 0:2]
+    for k in (0, -1):
+        d = ring.distance(shapely.geometry.Point(coords[k]))
+        if d > end_tol:
+            raise RuntimeError(f'splitHUC: an end of the cut is {d:g} from the boundary of HUC {huc}')
+    coords[0] = ring.interpolate(ring.project(shapely.geometry.Point(coords[0]))).coords[0]
+    coords[-1] = ring.interpolate(ring.project(shapely.geometry.Point(coords[-1]))).coords[0]
+    cut_line = shapely.geometry.LineString(coords)
+
+    # extend the ends a little past the boundary so split() sees clean crossings
+    def _ext(p, q):
+        d = p - q
+        return p + d / np.linalg.norm(d) * max(10 * grid, 1.e-3 * cut_line.length)
+    ext = shapely.geometry.LineString([_ext(coords[0], coords[1]), ] + list(coords)
+                                      + [_ext(coords[-1], coords[-2]), ])
+    pieces = [p for p in shapely.ops.split(poly, ext).geoms if p.area > 0]
+    if len(pieces) != 2:
+        raise RuntimeError(f'splitHUC: the cut splits HUC {huc} into {len(pieces)} pieces, not 2')
+    pt = piece_point if isinstance(piece_point, shapely.geometry.Point) else shapely.geometry.Point(piece_point)
+    k = int(np.argmin([p.distance(pt) for p in pieces]))
+    piece = shapely.set_precision(pieces[k], grid)
+    remaining = shapely.set_precision(pieces[1 - k], grid)
+    for p in (piece, remaining):
+        if not (isinstance(p, shapely.geometry.Polygon) and p.is_valid):
+            raise RuntimeError(f'splitHUC: a piece of HUC {huc} is a {p.geom_type}')
+
+    old_vertices = set(ring.coords)
+    out.at[i, 'geometry'] = remaining
+    report = dict(cut_length=cut_line.length, piece_area=piece.area, remaining_area=remaining.area)
+
+    if merge_into is not None:
+        j = out.index[out[id_col] == merge_into][0]
+        target = out.at[j, 'geometry']
+        if piece.intersection(target).length == 0:
+            raise RuntimeError(f'splitHUC: the piece of {huc} does not share an edge with {merge_into}')
+        old_vertices |= set(target.exterior.coords)
+        merged = shapely.set_precision(target.union(piece), grid)
+        if not (isinstance(merged, shapely.geometry.Polygon) and merged.is_valid and len(merged.interiors) == 0):
+            raise RuntimeError(f'splitHUC: merging the piece into {merge_into} gives a {merged.geom_type}')
+        out.at[j, 'geometry'] = merged
+        report['merged_area'] = merged.area
+        changed = [i, j]
+    else:
+        row = out.loc[i].copy()
+        for col in out.columns:
+            if col != 'geometry' and isinstance(row[col], type(huc)) and row[col] == huc:
+                row[col] = new_id
+        if 'tohuc' in out.columns:
+            row['tohuc'] = new_tohuc
+        if name_suffix and 'name' in out.columns and isinstance(row['name'], str):
+            row['name'] = row['name'] + name_suffix
+        for col in clear_cols:
+            if col in out.columns:
+                row[col] = None
+        row['geometry'] = piece
+        out = gpd.GeoDataFrame(pd.concat([out, row.to_frame().T], ignore_index=True),
+                               geometry='geometry', crs=hucs.crs)
+        out = out.astype(hucs.dtypes.drop('geometry').to_dict(), errors='ignore')
+        changed = [i, len(out) - 1]
+
+    for col, factor in area_cols.items():
+        if col in out.columns:
+            for c in changed:
+                out.at[c, col] = out.at[c, 'geometry'].area * factor
+
+    _nodeNewVertices(out, changed, old_vertices, grid, id_col)
+    logging.info(f'splitHUC {huc}: {report}')
     return out, report
 
 

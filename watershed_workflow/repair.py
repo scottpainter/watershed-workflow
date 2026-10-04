@@ -49,6 +49,9 @@ import pandas as pd
 import geopandas as gpd
 import shapely
 import shapely.geometry
+import shapely.ops
+from scipy.spatial import cKDTree
+from matplotlib import pyplot as plt
 
 import watershed_workflow.hydro.river
 import watershed_workflow.hydro.watershed
@@ -57,7 +60,8 @@ import watershed_workflow.sources.standard_names as names
 from watershed_workflow.diagnostics import Defect, DefectReport
 
 __all__ = ['Proposal', 'Recipe', 'proposeFixes', 'applyRecipe', 'ACTIONS', 'PROPOSERS',
-           'dropEmptyReaches', 'dropReaches', 'offsetDivide']
+           'dropEmptyReaches', 'dropReaches', 'offsetDivide', 'splitHUC',
+           'straightNeckCuts', 'equidistantCut']
 
 Frames = Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]
 
@@ -143,10 +147,19 @@ def offsetDivide(hucs : gpd.GeoDataFrame,
     return hucs, rivers
 
 
+def splitHUC(hucs : gpd.GeoDataFrame,
+             rivers : gpd.GeoDataFrame,
+             **params) -> Frames:
+    """hydro.watershed.splitHUC(): split a HUC along a cut into a new HUC, or into a neighbor."""
+    hucs, _ = watershed_workflow.hydro.watershed.splitHUC(hucs, **params)
+    return hucs, rivers
+
+
 ACTIONS : Dict[str, Callable[..., Frames]] = {
     'dropEmptyReaches' : dropEmptyReaches,
     'dropReaches' : dropReaches,
     'offsetDivide' : offsetDivide,
+    'splitHUC' : splitHUC,
 }
 
 
@@ -421,10 +434,333 @@ def _proposeDropDisconnected(defect, hucs, rivers, opts) -> List[Proposal]:
     return proposals
 
 
+#
+# Cuts separating the networks of a HUC with more than one outlet
+#
+class _CutChecker:
+    """Tests whether a line is an acceptable cut of a HUC.
+
+    It must run inside the HUC from boundary to boundary, keep each reach's
+    clearance, have its ends (new triple junctions) farther than
+    junction_tol from any reach endpoint (else simplify() would snap them
+    onto it) and junction_spacing from the HUC's existing junctions, and
+    split the HUC into two pieces, one holding the arm network and the
+    other the rest.
+    """
+    def __init__(self, poly, arm, rest, reaches, clearances, endpoints, junction_tol,
+                 huc_junctions=(), junction_spacing=0., grid=1.e-3):
+        self.poly = poly
+        self.ring = poly.exterior
+        self.cover = poly.buffer(10 * grid)
+        self.arm, self.rest = arm, rest
+        self.reaches, self.clearances = list(reaches), np.array(clearances)
+        self.blocked = shapely.ops.unary_union([r.buffer(c) for r, c in zip(self.reaches, self.clearances)])
+        blocked_ends = []
+        if len(endpoints) > 0 and junction_tol > 0:
+            blocked_ends.append(shapely.geometry.MultiPoint(endpoints).buffer(junction_tol))
+        if len(huc_junctions) > 0 and junction_spacing > 0:
+            blocked_ends.append(shapely.geometry.MultiPoint(huc_junctions).buffer(junction_spacing))
+        self.junctions = shapely.ops.unary_union(blocked_ends) if blocked_ends else shapely.geometry.Polygon()
+        self.grid = grid
+        for g in (self.cover, self.blocked, self.junctions):
+            shapely.prepare(g)
+
+    def snapEnds(self, line):
+        c = np.array(line.coords)
+        for k in (0, -1):
+            c[k] = self.ring.interpolate(self.ring.project(shapely.geometry.Point(c[k]))).coords[0]
+        return shapely.geometry.LineString(c)
+
+    def quick(self, lines):
+        """Vectorized pre-check of an array of lines: inside, clear of reaches."""
+        return shapely.covers(self.cover, lines) & ~shapely.intersects(self.blocked, lines)
+
+    def check(self, line):
+        """(arm piece, other piece) if line is an acceptable cut, else None."""
+        if not (self.quick(np.array([line, ]))[0]):
+            return None
+        ends = shapely.points(np.array(line.coords)[[0, -1]])
+        if shapely.intersects(self.junctions, ends).any():
+            return None
+        c = np.array(line.coords)
+        d0, d1 = c[0] - c[1], c[-1] - c[-2]
+        ext = shapely.geometry.LineString([c[0] + d0 / np.linalg.norm(d0)] + list(c) + [c[-1] + d1 / np.linalg.norm(d1)])
+        pieces = [p for p in shapely.ops.split(self.poly, ext).geoms if p.area > 0]
+        if len(pieces) != 2:
+            return None
+        k = int(np.argmax([self.arm.intersection(p).length for p in pieces]))
+        arm_piece, other = pieces[k], pieces[1 - k]
+        if self.arm.intersection(other).length > 1.e-6 or self.rest.intersection(arm_piece).length > 1.e-6:
+            return None
+        return arm_piece, other
+
+    def clearanceRatio(self, line):
+        return float(min(r.distance(line) / c for r, c in zip(self.reaches, self.clearances)))
+
+
+def straightNeckCuts(checker : _CutChecker,
+                     spacing : float = 20.,
+                     max_length : Optional[float] = None,
+                     neck_ratio : float = 3.,
+                     max_cuts : int = 2,
+                     max_length_factor : float = 2.) -> List[shapely.geometry.LineString]:
+    """The shortest straight cuts across necks of the HUC, shortest first.
+
+    Points every `spacing` along the boundary are paired if they are closer
+    than max_length (default: the square root of the HUC's area) and the
+    boundary between them, either way round, is at least neck_ratio times
+    longer than the straight line -- i.e. the HUC is pinched there.  Pairs
+    are tried shortest first.  Up to max_cuts distinct cuts are returned,
+    none longer than max_length_factor times the shortest.
+    """
+    ring = checker.ring
+    L = ring.length
+    s = np.arange(0., L, spacing)
+    pts = shapely.line_interpolate_point(ring, s)
+    ok = ~shapely.intersects(checker.blocked, pts) & ~shapely.intersects(checker.junctions, pts)
+    s, P = s[ok], shapely.get_coordinates(pts[ok])
+    if len(P) < 2:
+        return []
+    if max_length is None:
+        max_length = np.sqrt(checker.poly.area)
+
+    pairs = cKDTree(P).query_pairs(max_length, output_type='ndarray')
+    if len(pairs) == 0:
+        return []
+    chord = np.linalg.norm(P[pairs[:, 0]] - P[pairs[:, 1]], axis=1)
+    arc = np.abs(s[pairs[:, 0]] - s[pairs[:, 1]])
+    keep = np.minimum(arc, L - arc) >= neck_ratio * chord
+    pairs, chord = pairs[keep], chord[keep]
+    order = np.argsort(chord)
+    pairs, chord = pairs[order], chord[order]
+
+    cuts : List[shapely.geometry.LineString] = []
+    ends : List[np.ndarray] = []
+    batch = 5000
+    for b in range(0, len(pairs), batch):
+        if cuts and chord[b] > max_length_factor * cuts[0].length:
+            break
+        lines = shapely.linestrings(np.stack([P[pairs[b:b + batch, 0]], P[pairs[b:b + batch, 1]]], axis=1))
+        for k in np.nonzero(checker.quick(lines))[0]:
+            line = lines[k]
+            if cuts and line.length > max_length_factor * cuts[0].length:
+                return cuts
+            e = np.array(line.coords)
+            if any(min(np.linalg.norm(e - f, axis=1).max(), np.linalg.norm(e - f[::-1], axis=1).max())
+                   < 10 * spacing for f in ends):
+                continue
+            if checker.check(line) is not None:
+                cuts.append(line)
+                ends.append(e)
+                if len(cuts) == max_cuts:
+                    return cuts
+    return cuts
+
+
+def equidistantCut(checker : _CutChecker,
+                   spacing : float = 20.,
+                   simplify_tols : Tuple[float, ...] = (40., 20., 10., 0.)) -> Optional[shapely.geometry.LineString]:
+    """The line equidistant from the arm network and the rest of the HUC's reaches.
+
+    Built from the Voronoi diagram of the reaches, sampled every `spacing`
+    and labelled by network: the boundary of the arm's cells inside the
+    HUC.  It has the largest possible clearance from both networks, but
+    ignores topography.  It is simplified with the largest of
+    simplify_tols that keeps it an acceptable cut.  None if the arm's
+    region meets the HUC boundary in more than one stretch (one cut cannot
+    separate it) or no simplification is acceptable.
+    """
+    def sample(g):
+        if g.is_empty:
+            return np.zeros((0, 2))
+        return shapely.get_coordinates(shapely.segmentize(g, spacing))
+
+    arm_pts = np.unique(sample(checker.arm), axis=0)
+    rest_pts = np.unique(sample(checker.rest), axis=0)
+    if len(arm_pts) == 0 or len(rest_pts) == 0:
+        return None
+    rest_set = set(map(tuple, rest_pts))
+    arm_pts = np.array([p for p in arm_pts if tuple(p) not in rest_set])
+    pts = np.concatenate([arm_pts, rest_pts])
+    cells = shapely.voronoi_polygons(shapely.multipoints(pts),
+                                     extend_to=checker.poly.envelope.buffer(checker.poly.length),
+                                     ordered=True)
+    cells = list(cells.geoms)
+    region = shapely.ops.unary_union(cells[:len(arm_pts)]).intersection(checker.poly)
+    if region.geom_type != 'Polygon':
+        parts = list(getattr(region, 'geoms', []))
+        parts = [p for p in parts if p.geom_type == 'Polygon']
+        if not parts:
+            return None
+        region = max(parts, key=lambda p: checker.arm.intersection(p).length)
+
+    inside = region.boundary.difference(checker.ring.buffer(10 * checker.grid))
+    inside = shapely.ops.linemerge(inside) if inside.geom_type == 'MultiLineString' else inside
+    if inside.geom_type != 'LineString':
+        logging.info(f'equidistantCut: the arm region meets the boundary in more than one stretch')
+        return None
+    for tol in simplify_tols:
+        line = checker.snapEnds(inside.simplify(tol) if tol > 0 else inside)
+        if checker.check(line) is not None:
+            return line
+    return None
+
+
+def _outletNetworks(poly, live, outlets, id_col):
+    """For each outlet of a HUC, the reaches in the HUC that drain to it (River nodes)."""
+    trees = watershed_workflow.hydro.river.createRivers(live.copy(), method='geometry')
+    outlet_ids = [set(_findReach(live, r, id_col) for r in o['reaches']) - {None, } for o in outlets]
+    groups : List[list] = [[] for _ in outlets]
+    others = []
+    for tree in trees:
+        for node in tree:
+            if node.linestring.intersection(poly).length == 0:
+                continue
+            n = node
+            while n is not None:
+                k = next((k for k, ids in enumerate(outlet_ids) if str(n[id_col]) in ids), None)
+                if k is not None:
+                    groups[k].append(node)
+                    break
+                n = n.parent
+            else:
+                others.append(node)
+    return trees, groups, others
+
+
+def _nextHUCId(hucs, huc, huc_id_col):
+    taken = set(hucs[huc_id_col].astype(str))
+    for letter in 'abcdefghijklmnopqrstuvwxyz':
+        if f'{huc}{letter}' not in taken:
+            return f'{huc}{letter}'
+    raise RuntimeError(f'no free ID for a piece of {huc}')
+
+
+def _hucJunctions(hucs, poly):
+    """Points on poly's boundary where its neighbor changes (HUC triple junctions)."""
+    pts = []
+    for g in hucs.geometry:
+        if g.equals(poly) or not g.intersects(poly):
+            continue
+        inter = poly.boundary.intersection(g.boundary)
+        lines = [l for l in getattr(inter, 'geoms', [inter, ]) if l.geom_type == 'LineString' and l.length > 0]
+        if lines:
+            merged = shapely.ops.linemerge(lines)
+            pts.extend(map(tuple, shapely.get_coordinates(merged.boundary)))
+    return pts
+
+
+def _checkBuildsWatershed(hucs, changed, huc_id_col):
+    """Raise if the changed HUCs and their neighbors do not build a Watershed (e.g. a pair of
+    HUCs now sharing two separate stretches of boundary)."""
+    sel = hucs[huc_id_col].isin([c for c in changed if c is not None])
+    region = hucs.loc[sel].geometry.union_all().buffer(1.)
+    local = hucs[hucs.geometry.intersects(region)]
+    show = plt.show
+    plt.show = lambda *args, **kwargs: None
+    try:
+        watershed_workflow.hydro.watershed.Watershed(local.copy())
+    finally:
+        plt.show = show
+        plt.close('all')
+
+
+def _proposeSplitHUC(defect, hucs, rivers, opts) -> List[Proposal]:
+    """A HUC with more than one outlet: cut each extra outlet's network off.
+
+    For each outlet but the main one (largest drainage), find cuts that
+    separate the reaches draining to it from the rest (straightNeckCuts,
+    then equidistantCut), and offer for each cut: the piece as a new HUC,
+    and the piece merged into the HUC it drains into.
+    """
+    id_col, huc_id_col = opts['id_col'], opts['huc_id_col']
+    outlets = defect.details.get('outlets', [])
+    if len(outlets) < 2 or not defect.hucs:
+        return []
+    huc = defect.hucs[0]
+    poly = hucs.loc[hucs[huc_id_col] == huc].geometry.iloc[0]
+    live = _live(rivers)
+    trees, groups, others = _outletNetworks(poly, live, outlets, id_col)
+    if sum(1 for g in groups if g) < 2:
+        return []
+
+    def size(g):
+        das = [n[names.DRAINAGE_AREA] for n in g if names.DRAINAGE_AREA in n]
+        return (max(das) if das else 0., sum(n.linestring.length for n in g))
+    main = max(range(len(groups)), key=lambda k: size(groups[k]))
+
+    width = watershed_workflow.mesh.river_mesh.widthByOrderFunction(
+        watershed_workflow.mesh.river_mesh.computeWidthByOrder(live))
+    clearance = lambda n: opts['clearance_factor'] * width(n)
+    nodes = [n for t in trees for n in t]
+    max_c = max(clearance(n) for n in nodes)
+    near = [n for n in nodes if n.linestring.distance(poly) < max_c]
+    endpoints = [n.linestring.coords[-1] for n in nodes] + [n.linestring.coords[0] for t in trees for n in t.leaf_nodes]
+    endpoints = [p[0:2] for p in endpoints if shapely.geometry.Point(p).distance(poly) < opts['junction_tol']]
+
+    proposals = []
+    for k, group in enumerate(groups):
+        if k == main or not group:
+            continue
+        arm = shapely.ops.unary_union([n.linestring for n in group]).intersection(poly)
+        rest = shapely.ops.unary_union([n.linestring for j, g in enumerate(groups) if j != k for n in g]
+                                       + [n.linestring for n in others]).intersection(poly)
+        checker = _CutChecker(poly, arm, rest, [n.linestring for n in near], [clearance(n) for n in near],
+                              endpoints, opts['junction_tol'], _hucJunctions(hucs, poly),
+                              opts['junction_spacing'])
+        cuts = [('straight', c) for c in straightNeckCuts(checker)]
+        eq = equidistantCut(checker)
+        if eq is not None:
+            cuts.append(('equidistant', eq))
+        if not cuts:
+            logging.info(f'proposeFixes: no acceptable cut separates outlet {k} of HUC {huc}')
+            continue
+
+        into = outlets[k]['into']
+        into_huc = None if into == 'domain exterior' else into
+        arm_ids = [str(n[id_col]) for n in group]
+        for method, line in cuts:
+            arm_piece, other = checker.check(line)
+            preview = dict(method=method, cut_length=line.length,
+                           min_clearance_ratio=checker.clearanceRatio(line),
+                           piece_area=arm_piece.area, remaining_area=other.area, arm_reaches=len(arm_ids))
+            geometry = gpd.GeoDataFrame(dict(role=['cut', 'piece', 'arm reaches', 'other reaches']),
+                                        geometry=[line, arm_piece, arm, rest], crs=hucs.crs)
+            caveat = ('a straight line across the neck, not traced from topography' if method == 'straight'
+                      else 'the line equidistant from the two networks, not traced from topography')
+            base = dict(huc=huc, cut=[list(c) for c in line.coords],
+                        piece_point=list(arm_piece.representative_point().coords[0]), id_col=huc_id_col)
+
+            new_id = _nextHUCId(hucs, huc, huc_id_col)
+            options = [(Proposal('splitHUC', dict(base, new_id=new_id, new_tohuc=into_huc),
+                                 f'split HUC {huc} along a {line.length:.0f} {method} cut; the piece '
+                                 f'drained by reaches {arm_ids[:3]}{"..." if len(arm_ids) > 3 else ""} '
+                                 f'becomes HUC {new_id}, draining to {into}', defect,
+                                 preview=dict(preview), geometry=geometry, caveats=[caveat, ]), 0)]
+            if into_huc is not None:
+                target = hucs.loc[hucs[huc_id_col] == into_huc].geometry.iloc[0]
+                p = Proposal('splitHUC', dict(base, merge_into=into_huc),
+                             f'cut the piece of HUC {huc} drained by reaches {arm_ids[:3]}'
+                             f'{"..." if len(arm_ids) > 3 else ""} off along a {line.length:.0f} {method} '
+                             f'cut and add it to {into_huc}', defect, preview=dict(preview), geometry=geometry,
+                             caveats=[caveat, f'{into_huc} grows by {arm_piece.area / target.area:.0%} and '
+                                      f'{huc} shrinks by {arm_piece.area / poly.area:.0%}'])
+                options.append((p, 1))
+            for p, rank in options:
+                try:
+                    _checkBuildsWatershed(p.apply(hucs, rivers)[0], [huc, into_huc, p.params.get('new_id')],
+                                          huc_id_col)
+                except Exception as err:
+                    logging.info(f'proposeFixes: {p.description} not offered: {err}')
+                    continue
+                proposals.append((rank, len(proposals), p))
+    return [p for _, _, p in sorted(proposals, key=lambda t: (t[0], t[1]))]
+
+
 PROPOSERS : Dict[str, List[Callable[..., List[Proposal]]]] = {
     'empty-geometry' : [_proposeDropEmpty, ],
     'multiple-crossing' : [_proposeOffsetDivide, ],
-    'multiple-outlets' : [_proposeDropDisconnected, ],
+    'multiple-outlets' : [_proposeDropDisconnected, _proposeSplitHUC],
 }
 
 
@@ -460,7 +796,9 @@ def proposeFixes(report : DefectReport,
         One list per report.defects entry; empty if nothing is proposed.
     """
     opts = dict(clearance_factor=clearance_factor, reachcode_col=reachcode_col, id_col=id_col,
-                huc_id_col=huc_id_col)
+                huc_id_col=huc_id_col,
+                junction_tol=report.params.get('snap_triple_junctions_tol', 0.) or 0.,
+                junction_spacing=report.params.get('reach_segment_target_length', 0.) or 0.)
     out = []
     for defect in report.defects:
         props = []

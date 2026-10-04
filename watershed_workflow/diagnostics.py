@@ -91,10 +91,14 @@ class DefectReport:
         What it handled itself, and stages that were skipped.
     mesh : Mesh2D, optional
         The mesh, if the mesh stage ran and succeeded.
+    params : dict
+        The findDefects() settings that later steps need (e.g. repair
+        proposals keep new HUC corners outside snap_triple_junctions_tol).
     """
     defects : List[Defect] = dataclasses.field(default_factory=list)
     notes : List[str] = dataclasses.field(default_factory=list)
     mesh : Any = None
+    params : Dict[str, Any] = dataclasses.field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -346,6 +350,21 @@ def _checkMesh(report : DefectReport,
                                 river_cells=int(n_river)))
 
 
+def _watershedDefect(report : DefectReport, hucs : gpd.GeoDataFrame, huc_id_col : str, err : Exception) -> None:
+    """Report why Watershed() could not be built from the HUC polygons."""
+    if all(hasattr(err, a) for a in ('i_p1', 'i_p2', 'inter')):
+        # intersectAndSplit(): two HUCs whose shared boundary is not one line
+        ids = list(hucs[huc_id_col]) if huc_id_col in hucs else list(hucs.index)
+        a, b = ids[err.i_p1], ids[err.i_p2]
+        parts = list(getattr(err.inter, 'geoms', [err.inter, ]))
+        report.add('hucs', 'watershed',
+                   f'HUCs {a} and {b} share {len(parts)} separate stretches of boundary; Watershed() needs '
+                   'each pair of HUCs to share at most one', location=err.inter.representative_point(),
+                   hucs=[a, b], details=dict(stretches=len(parts)))
+    else:
+        report.add('hucs', 'watershed', f'Watershed() failed on the HUC polygons: {type(err).__name__}: {err}')
+
+
 def findDefects(hucs : gpd.GeoDataFrame,
                 rivers : gpd.GeoDataFrame,
                 reach_segment_target_length : float,
@@ -407,21 +426,26 @@ def findDefects(hucs : gpd.GeoDataFrame,
     DefectReport
     """
     report = DefectReport()
+    if snap_triple_junctions_tol is None:
+        snap_triple_junctions_tol = 3 * reach_segment_target_length
+    report.params = dict(reach_segment_target_length=reach_segment_target_length,
+                         huc_segment_target_length=huc_segment_target_length,
+                         snap_triple_junctions_tol=snap_triple_junctions_tol, huc_id_col=huc_id_col)
 
     river_list = _buildRivers(report, rivers)
     if len(river_list) == 0:
         report.note('no river network could be built; later stages skipped')
         return report
 
-    try:
-        ws = watershed_workflow.Watershed(hucs.copy(deep=True))
-    except Exception as err:
-        report.add('hucs', 'watershed', f'Watershed() failed on the HUC polygons: {type(err).__name__}: {err}')
-        return report
-
     show = plt.show
     plt.show = lambda *args, **kwargs: None    # pipeline functions plot diagnostics before raising
     try:
+        try:
+            ws = watershed_workflow.Watershed(hucs.copy(deep=True))
+        except Exception as err:
+            _watershedDefect(report, hucs, huc_id_col, err)
+            return report
+
         _simplifyIsolated(report, ws, river_list, reach_segment_target_length, huc_segment_target_length,
                           river_close_distance, river_far_distance, min_angle, junction_min_angle,
                           snap_triple_junctions_tol)
@@ -441,4 +465,5 @@ def findDefects(hucs : gpd.GeoDataFrame,
                            tessalate_kwargs)
     finally:
         plt.show = show
+        plt.close('all')
     return report

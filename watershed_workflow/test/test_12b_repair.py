@@ -80,23 +80,28 @@ def test_drop_disconnected_network_proposal():
     assert len(outlets) == 1
     props = repair.proposeFixes(report, _hucs(),
                                 _rivers(lines, reachcodes=['01020304000001'] * 2 + ['09990000000001']))
-    [p] = props[outlets[0]]
+    p = props[outlets[0]][0]
     assert p.action == 'dropReaches' and p.params['reaches'] == ['2']
     assert p.preview['foreign'] is True and not p.caveats
 
     # the same network with the domain's reachcode is still offered, with a caveat
     rivers = _rivers(lines)
-    [p] = repair.proposeFixes(diag.findDefects(_hucs(), rivers, **KWARGS), _hucs(), rivers)[outlets[0]]
-    assert p.preview['foreign'] is False and p.caveats
+    p = repair.proposeFixes(diag.findDefects(_hucs(), rivers, **KWARGS), _hucs(), rivers)[outlets[0]][0]
+    assert p.action == 'dropReaches' and p.preview['foreign'] is False and p.caveats
 
 
-def test_no_proposal_when_both_outlets_are_the_main_network():
+def test_equidistant_cut_when_there_is_no_neck():
+    # two branches of the main network leave the square A into B: no neck, so no straight cut, but the
+    # line midway between the branches separates them
     lines = [[(1500, 500), (2000, 500)], [(200, 300), (1000, 300), (1500, 500)],
              [(200, 700), (1000, 700), (1500, 500)]]
     report = diag.findDefects(_hucs(), _rivers(lines), **KWARGS)
-    props = repair.proposeFixes(report, _hucs(), _rivers(lines))
-    assert [d.kind for d in report.defects] == ['multiple-outlets']
-    assert props == [[]]
+    [props] = repair.proposeFixes(report, _hucs(), _rivers(lines))
+    assert [p.preview['method'] for p in props] == ['equidistant', 'equidistant']
+    cut = props[0].params['cut']
+    assert all(c[1] == pytest.approx(500., abs=1.) for c in cut)
+    h, r = props[0].apply(_hucs(), _rivers(lines))
+    assert diag.findDefects(h, r, **KWARGS).ok
 
 
 def test_recipe_round_trip_and_rejections(tmp_path):
@@ -125,7 +130,7 @@ def test_recipe_round_trip_and_rejections(tmp_path):
     report = diag.findDefects(h2, r2, **KWARGS)
     props = repair.proposeFixes(report, h2, r2, recipe=loaded)
     assert [d.kind for d in report.defects] == ['multiple-outlets']
-    assert props == [[]]
+    assert 'dropReaches' not in [p.action for p in props[0]]
 
 
 def test_record_requires_a_decision_and_serializable_params():
@@ -134,3 +139,15 @@ def test_record_requires_a_decision_and_serializable_params():
         repair.Recipe().record(p, 'maybe')
     with pytest.raises(TypeError):
         repair.Recipe().record(repair.Proposal('dropReaches', dict(reaches={1, 2}), 'x'), 'approved')
+
+
+def test_huc_pair_sharing_two_stretches_is_reported_not_plotted():
+    # A wraps around B's top on two sides of a notch: they share two separate edges
+    a = shapely.unary_union([shapely.geometry.box(0, 0, 1000, 1000), shapely.geometry.box(1000, 400, 1200, 600),
+                             shapely.geometry.box(1200, 0, 2200, 1000)])
+    b = shapely.geometry.box(0, -1000, 2200, 0)
+    hucs = geopandas.GeoDataFrame({names.ID: ['A', 'B'], 'tohuc': ['B', 'OUTSIDE']}, geometry=[a, b],
+                                  crs='EPSG:5070')
+    report = diag.findDefects(hucs, _rivers(ONE_STREAM), **KWARGS)
+    [d] = report.defects
+    assert d.kind == 'watershed' and sorted(d.hucs) == ['A', 'B'] and d.details['stretches'] == 2
