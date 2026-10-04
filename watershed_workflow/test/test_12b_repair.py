@@ -159,3 +159,12 @@ def test_move_river_node_keeps_reaches_connected():
     assert out.geometry[0].coords[-1] == out.geometry[1].coords[0] == out.geometry[2].coords[-1] == (10., -3.)
     with pytest.raises(ValueError):
         repair.moveRiverNode(None, rivers, [10, 0], [10, -3], expected=2)
+
+
+def test_sequence_applies_steps_in_order():
+    rivers = _rivers([[(0, 0), (10, 0)], [(10, 0), (20, 0)], [(10, 5), (10, 0)]])
+    p = repair.Proposal('sequence', dict(steps=[
+        dict(action='moveRiverNode', params=dict(point_from=[10, 0], point_to=[10, -3])),
+        dict(action='dropReaches', params=dict(reaches=['2']))]), 'move then drop')
+    _, out = p.apply(_hucs(), rivers)
+    assert list(out[names.ID]) == ['0', '1'] and out.geometry[0].coords[-1] == (10., -3.)

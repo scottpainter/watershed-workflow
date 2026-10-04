@@ -60,7 +60,7 @@ import watershed_workflow.sources.standard_names as names
 from watershed_workflow.diagnostics import Defect, DefectReport
 
 __all__ = ['Proposal', 'Recipe', 'proposeFixes', 'applyRecipe', 'ACTIONS', 'PROPOSERS',
-           'dropEmptyReaches', 'dropReaches', 'offsetDivide', 'splitHUC', 'moveRiverNode',
+           'dropEmptyReaches', 'dropReaches', 'offsetDivide', 'splitHUC', 'moveRiverNode', 'sequence',
            'straightNeckCuts', 'equidistantCut']
 
 Frames = Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]
@@ -193,12 +193,22 @@ def splitHUC(hucs : gpd.GeoDataFrame,
     return hucs, rivers
 
 
+def sequence(hucs : gpd.GeoDataFrame,
+             rivers : gpd.GeoDataFrame,
+             steps : List[dict]) -> Frames:
+    """Apply several actions in order, as one step: steps is a list of {'action', 'params'}."""
+    for step in steps:
+        hucs, rivers = ACTIONS[step['action']](hucs, rivers, **step['params'])
+    return hucs, rivers
+
+
 ACTIONS : Dict[str, Callable[..., Frames]] = {
     'dropEmptyReaches' : dropEmptyReaches,
     'dropReaches' : dropReaches,
     'offsetDivide' : offsetDivide,
     'splitHUC' : splitHUC,
     'moveRiverNode' : moveRiverNode,
+    'sequence' : sequence,
 }
 
 
@@ -796,10 +806,120 @@ def _proposeSplitHUC(defect, hucs, rivers, opts) -> List[Proposal]:
     return [p for _, _, p in sorted(proposals, key=lambda t: (t[0], t[1]))]
 
 
+def _proposeCloseOutlets(defect, hucs, rivers, opts) -> List[Proposal]:
+    """Two outlets close together into the same HUC: make their confluence the single outlet.
+
+    Typically the reaches meet at a confluence just inside the HUC, which
+    simplify() snaps onto the divide, but one of them wiggles across the
+    divide just upstream, so the HUC is left with two exits a few tens of
+    metres apart (and often a smoothSharpAngles failure from the stub left
+    between them).  For each pair of outlets into the same HUC closer than
+    close_outlet_distance, follow both downstream to the reach where they
+    meet; if its upstream end (the confluence) is within junction_spacing of
+    the divide, propose:
+
+    1. moving the confluence onto the divide (moveRiverNode), then a
+       flat-ended offsetDivide of the divide into the downstream HUC around
+       the reaches meeting there, so the confluence is the HUC's single
+       outlet; and, second,
+    2. a round-ended offsetDivide without the snap, which leaves the
+       confluence inside the HUC, draining by a crossing of the downstream
+       reach.
+    """
+    id_col, huc_id_col = opts['id_col'], opts['huc_id_col']
+    outlets = defect.details.get('outlets', [])
+    if len(outlets) < 2 or not defect.hucs:
+        return []
+    huc = defect.hucs[0]
+    live = _live(rivers)
+    trees = watershed_workflow.hydro.river.createRivers(live.copy(), method='geometry')
+    nodes = { str(n[id_col]) : n for t in trees for n in t }
+    width = watershed_workflow.mesh.river_mesh.widthByOrderFunction(
+        watershed_workflow.mesh.river_mesh.computeWidthByOrder(live))
+
+    def downstream(n):
+        path = []
+        while n is not None:
+            path.append(n)
+            n = n.parent
+        return path
+
+    proposals = []
+    seen = set()
+    for i in range(len(outlets)):
+        for j in range(i + 1, len(outlets)):
+            a, b = outlets[i], outlets[j]
+            if a['into'] != b['into'] or a['into'] == 'domain exterior':
+                continue
+            if a['point'].distance(b['point']) > opts['close_outlet_distance']:
+                continue
+            na = [nodes.get(_findReach(live, r, id_col)) for r in a['reaches']]
+            nb = [nodes.get(_findReach(live, r, id_col)) for r in b['reaches']]
+            if None in na or None in nb or not na or not nb:
+                continue
+            on_b = set(id(n) for n in downstream(nb[0]))
+            common = next((n for n in downstream(na[0]) if id(n) in on_b), None)
+            if common is None or id(common) in seen:
+                continue
+            seen.add(id(common))
+            c = shapely.geometry.Point(common.linestring.coords[0])
+            if c.distance(a['point']) > opts['close_outlet_distance']:
+                continue
+            into = a['into']
+            keep_poly = hucs.loc[hucs[huc_id_col] == huc].geometry.iloc[0]
+            other_poly = hucs.loc[hucs[huc_id_col] == into].geometry.iloc[0]
+            divide = keep_poly.boundary.intersection(other_poly.boundary)
+            if divide.is_empty:
+                continue
+            q = shapely.ops.nearest_points(divide, c)[0]
+            if c.distance(q) > opts['junction_spacing']:
+                continue
+            upstream = [str(ch[id_col]) for ch in common.children]
+            clr = { r : float(opts['clearance_factor'] * width(nodes[r])) for r in upstream }
+            offset = dict(keep=huc, other=into, reaches=upstream, clearance=clr, id_col=id_col,
+                          huc_id_col=huc_id_col)
+            span = f'{min(clr.values()):.1f}-{max(clr.values()):.1f} ({opts["clearance_factor"]} x bankfull width)'
+            options = [
+                Proposal('sequence', dict(steps=[
+                    dict(action='moveRiverNode', params=dict(point_from=[c.x, c.y], point_to=[q.x, q.y],
+                                                             expected=len(upstream) + 1)),
+                    dict(action='offsetDivide', params=dict(offset, cap_style='flat'))]),
+                         f'snap the confluence of reaches {upstream} {c.distance(q):.1f} onto the {huc}|{into} '
+                         f'divide, then move the divide into {into}, flat-ended at the confluence, {span} off '
+                         f'those reaches: the confluence becomes the single outlet of {huc}', defect),
+                Proposal('offsetDivide', dict(offset, cap_style='round'),
+                         f'move the {huc}|{into} divide into {into}, {span} off reaches {upstream} and around '
+                         f'their confluence', defect,
+                         caveats=[f'the confluence ends up inside {huc}, which drains by a crossing of reach '
+                                  f'{common[id_col]} instead of at the confluence']),
+            ]
+            for p in options:
+                try:
+                    new_hucs, new_rivers = p.apply(hucs, rivers)
+                    _checkBuildsWatershed(new_hucs, [huc, into], huc_id_col)
+                except Exception as err:
+                    logging.info(f'proposeFixes: {p.description} not offered: {err}')
+                    continue
+                new_other = new_hucs.loc[new_hucs[huc_id_col] == into].geometry.iloc[0]
+                new_keep = new_hucs.loc[new_hucs[huc_id_col] == huc].geometry.iloc[0]
+                outlet_reach = new_rivers.loc[new_rivers[id_col].astype(str) == str(common[id_col])].geometry.iloc[0]
+                p.preview = dict(outlet_separation=a['point'].distance(b['point']), snap_distance=c.distance(q),
+                                 area_moved=other_poly.area - new_other.area,
+                                 confluence_to_boundary=new_keep.boundary.distance(
+                                     shapely.geometry.Point(outlet_reach.coords[0])))
+                p.geometry = gpd.GeoDataFrame(dict(role=['area moved', 'confluence', 'reaches']),
+                                              geometry=[other_poly.difference(new_other), c,
+                                                        shapely.ops.unary_union([nodes[r].linestring for r in upstream]
+                                                                                + [common.linestring])],
+                                              crs=hucs.crs)
+                proposals.append(p)
+    return proposals
+
+
 PROPOSERS : Dict[str, List[Callable[..., List[Proposal]]]] = {
     'empty-geometry' : [_proposeDropEmpty, ],
     'multiple-crossing' : [_proposeOffsetDivide, ],
-    'multiple-outlets' : [_proposeDropDisconnected, _proposeSplitHUC],
+    'multiple-outlets' : [_proposeDropDisconnected, _proposeCloseOutlets, _proposeSplitHUC],
 }
 
 
@@ -810,7 +930,8 @@ def proposeFixes(report : DefectReport,
                  reachcode_col : str = 'reachcode',
                  id_col : str = names.ID,
                  huc_id_col : str = names.ID,
-                 recipe : Optional[Recipe] = None) -> List[List[Proposal]]:
+                 recipe : Optional[Recipe] = None,
+                 close_outlet_distance : Optional[float] = None) -> List[List[Proposal]]:
     """Candidate fixes for each defect in a report, best first.
 
     Parameters
@@ -828,6 +949,9 @@ def proposeFixes(report : DefectReport,
         ID columns of rivers and hucs.
     recipe : Recipe, optional
         Proposals it has already rejected are left out.
+    close_outlet_distance : float, optional
+        Outlets of a HUC into the same HUC closer than this are treated as one
+        outlet split by a wiggle (default: 2 x reach_segment_target_length).
 
     Returns
     -------
@@ -837,7 +961,9 @@ def proposeFixes(report : DefectReport,
     opts = dict(clearance_factor=clearance_factor, reachcode_col=reachcode_col, id_col=id_col,
                 huc_id_col=huc_id_col,
                 junction_tol=report.params.get('snap_triple_junctions_tol', 0.) or 0.,
-                junction_spacing=report.params.get('reach_segment_target_length', 0.) or 0.)
+                junction_spacing=report.params.get('reach_segment_target_length', 0.) or 0.,
+                close_outlet_distance=close_outlet_distance if close_outlet_distance is not None
+                else 2 * (report.params.get('reach_segment_target_length', 0.) or 50.))
     out = []
     for defect in report.defects:
         props = []
